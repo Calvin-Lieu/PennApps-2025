@@ -10,18 +10,34 @@ dist/
 # VSCode
 .vscode/
 
-# Backend generated data / caches
-backend/data/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
 
-# osmnx / requests-cache
-.cache/osmnx/
-.osmnx_cache/
-requests-cache.sqlite
+# Jupyter Notebook
+.ipynb_checkpoints
 
-# ignore generated/cache/data
+# Node
+node_modules/
+dist/
+.npm/
+
+# Generated data / caches
 backend/data/
+backend/*.gpickle
+cache/
 *.sqlite
 *.cache
 .osmnx_cache/
 .cache/
 requests-cache.sqlite
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

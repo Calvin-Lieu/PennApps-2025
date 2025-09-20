@@ -21,6 +21,34 @@ from pyproj import Geod
 import matplotlib.pyplot as plt
 import pickle
 
+
+def _features_from_bbox_compat(north, south, east, west, tags=None):
+    """Compatibility wrapper supporting OSMnx v1.x and v2.x.
+    - v2.x: ox.features.features_from_bbox
+    - v1.x: ox.geometries_from_bbox
+    Handles differing call signatures and bbox tuple ordering.
+    """
+    # Try v2.x API first
+    try:
+        return ox.features.features_from_bbox(north, south, east, west, tags)
+    except AttributeError:
+        # features submodule not available (likely v1.x) → use geometries_from_bbox
+        try:
+            return ox.geometries_from_bbox(north, south, east, west, tags)
+        except TypeError:
+            # Some builds require tags as a named argument
+            return ox.geometries_from_bbox(north, south, east, west, tags=tags)
+    except TypeError:
+        # Some OSMnx v2 builds expect a bbox tuple in (south, west, north, east)
+        try:
+            return ox.features.features_from_bbox((south, west, north, east), tags)
+        except AttributeError:
+            # v1.x fallback
+            try:
+                return ox.geometries_from_bbox(north, south, east, west, tags)
+            except TypeError:
+                return ox.geometries_from_bbox(north, south, east, west, tags=tags)
+
 DEFAULT_ROAD_TAGS: Dict[str, Iterable[str]] = {
     "highway": [
         "motorway",
@@ -93,7 +121,8 @@ def build_graph_segments(
 
     if bbox is None:
         print(f"[build_graph_2] bbox not provided. Geocoding '{place}'...")
-        city = ox.geocode_to_gdf(place)
+        # OSMnx v2.x: use geocoder submodule
+        city = ox.geocoder.geocode_to_gdf(place)
         minx, miny, maxx, maxy = city.total_bounds
         bbox = (maxy, miny, maxx, minx)
         print(
@@ -106,7 +135,8 @@ def build_graph_segments(
 
     north, south, east, west = bbox
     print("[build_graph_2] Fetching OSM geometries...")
-    gdf = ox.geometries_from_bbox(north=north, south=south, east=east, west=west, tags=tags)
+    # OSMnx v2.x: use features submodule (compat wrapper handles signature differences)
+    gdf = _features_from_bbox_compat(north, south, east, west, tags)
     print(f"[build_graph_2] Fetched {len(gdf)} features")
 
     G = nx.Graph()

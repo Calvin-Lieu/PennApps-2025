@@ -2,6 +2,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, List, Tuple, Optional
+
+# helper that finds a shop waypoint and returns routed paths
+from backend.find_shop_waypoint import route_via_nearby_shop
 import networkx as nx
 import os
 from pyproj import Geod
@@ -31,9 +34,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="PennApps Demo Backend", lifespan=lifespan)
 
 # Add CORS middleware
+# Allow Vite dev server origins during development; adjust for production as needed
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend domain
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -175,3 +182,50 @@ async def shortest_path(req: ShortestPathRequest) -> Dict[str, Any]:
         return {"error": "No path found between the points"}
     except Exception as e:
         return {"error": f"Path computation failed: {str(e)}"}
+
+
+class RouteRequest(BaseModel):
+    start_lat: float
+    start_lng: float
+    end_lat: float
+    end_lng: float
+    max_shop_dist_m: Optional[float] = 100.0
+
+
+@app.post("/route_via_shop")
+def route_via_shop(req: RouteRequest):
+    try:
+        result = route_via_nearby_shop(
+            start_lon=req.start_lng,
+            start_lat=req.start_lat,
+            end_lon=req.end_lng,
+            end_lat=req.end_lat,
+            max_shop_dist_m=req.max_shop_dist_m,
+            G=G,  # use preloaded graph for speed and determinism
+        )
+    except Exception as e:
+        # Log full traceback to server console and return a JSON error so CORS middleware can add headers
+        import traceback
+
+        traceback.print_exc()
+        return {"error": f"Internal server error: {str(e)}"}
+
+    # Convert to lat/lng arrays for frontend
+    def node_to_latlng(n: Tuple[float, float]) -> List[float]:
+        # Graph nodes are (lon, lat) but Leaflet expects [lat, lng]
+        return [n[1], n[0]]
+
+    base_path = [node_to_latlng(n) for n in result.get("base_path", [])]
+    via_path = [node_to_latlng(n) for n in result.get("route_u_shop_v", [])]
+
+    shop_point = None
+    if result.get("shop_point"):
+        shop_point = [result["shop_point"][1], result["shop_point"][0]]
+
+    return {
+        "base_path": base_path,
+        "via_path": via_path,
+        "shop_point": shop_point,
+        "shop_label": result.get("shop_label"),
+        "note": result.get("note"),
+    }

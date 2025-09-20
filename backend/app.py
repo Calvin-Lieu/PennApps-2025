@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Dict, Any, List, Tuple, Optional
 
 # helper that finds a shop waypoint and returns routed paths
-from backend.find_shop_waypoint import route_via_nearby_shop
+from backend.find_shop_waypoint import route_via_nearby_shop, _nearest_node
 import networkx as nx
 import os
 from pyproj import Geod
@@ -189,43 +189,69 @@ class RouteRequest(BaseModel):
     start_lng: float
     end_lat: float
     end_lng: float
-    max_shop_dist_m: Optional[float] = 100.0
+    shop_tags: Dict[str, int] = {}
+    tag_match_rule: Optional[str] = 'any'
+    max_dist: Optional[int] = 1000
 
 
 @app.post("/route_via_shop")
 def route_via_shop(req: RouteRequest):
+    if not req.shop_tags:
+        # If no shops are requested, just return the shortest path.
+        # This handles the "include shop stop" being unchecked.
+        if G is None:
+            return {"error": "Graph not loaded"}
+        
+        start_node = _nearest_node(G, req.start_lng, req.start_lat)
+        end_node = _nearest_node(G, req.end_lng, req.end_lat)
+
+        if not start_node or not end_node:
+            return {"error": "Could not find nearest nodes for start/end points"}
+
+        try:
+            base_path_nodes = nx.shortest_path(G, source=start_node, target=end_node, weight="length")
+            base_path_coords = [ (G.nodes[n]['x'], G.nodes[n]['y']) for n in base_path_nodes]
+            
+            return {
+                "base_path": lonlat_to_latlng(base_path_coords),
+                "via_path": [],
+                "shop_points": [],
+                "shop_label": None,
+                "note": "No shop requested, returning direct path.",
+            }
+        except nx.NetworkXNoPath:
+            return {"error": "No path found between start and end points"}
+
     try:
         result = route_via_nearby_shop(
             start_lon=req.start_lng,
             start_lat=req.start_lat,
             end_lon=req.end_lng,
             end_lat=req.end_lat,
-            max_shop_dist_m=req.max_shop_dist_m,
-            G=G,  # use preloaded graph for speed and determinism
+            shop_tags=req.shop_tags,
+            tag_match_rule=req.tag_match_rule,
+            G=G,
+            max_search_dist_m=req.max_dist,
         )
     except Exception as e:
-        # Log full traceback to server console and return a JSON error so CORS middleware can add headers
         import traceback
-
         traceback.print_exc()
         return {"error": f"Internal server error: {str(e)}"}
 
     # Convert to lat/lng arrays for frontend
     def node_to_latlng(n: Tuple[float, float]) -> List[float]:
-        # Graph nodes are (lon, lat) but Leaflet expects [lat, lng]
         return [n[1], n[0]]
 
     base_path = [node_to_latlng(n) for n in result.get("base_path", [])]
     via_path = [node_to_latlng(n) for n in result.get("route_u_shop_v", [])]
 
-    shop_point = None
-    if result.get("shop_point"):
-        shop_point = [result["shop_point"][1], result["shop_point"][0]]
+    shop_points = []
+    if result.get("shop_points"):
+        shop_points = [{"point": [p[1], p[0]], "label": label} for p, label in result["shop_points"]]
 
     return {
         "base_path": base_path,
         "via_path": via_path,
-        "shop_point": shop_point,
-        "shop_label": result.get("shop_label"),
+        "shop_points": shop_points,
         "note": result.get("note"),
     }

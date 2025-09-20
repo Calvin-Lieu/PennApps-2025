@@ -161,6 +161,7 @@ def fetch_shops_from_point(
     center_point: Tuple[float, float],
     radius_m: int,
     tags: Optional[Dict[str, Iterable[str]]] = None,
+    tag_match_rule: str = 'any',
 ):
     """Fetch OSM shop POIs as points within a radius of a center point."""
     # Use a specific set of tags for relevant shops, inspired by the user's notebook.
@@ -181,6 +182,18 @@ def fetch_shops_from_point(
 
     if gdf.empty:
         print("No features found in radius for the given tags.")
+        return gdf
+
+    # Filter by tag match rule ('any' or 'all')
+    if tag_match_rule == 'all':
+        # For 'all', a feature must have a value for each key in the tags dict
+        for key, values in tags.items():
+            if not values: continue # Skip empty tag lists
+            # Drop rows where the key is missing or the value is not in the list of desired values
+            gdf = gdf[gdf[key].isin(values)]
+    
+    if gdf.empty:
+        print(f"No features remained after applying '{tag_match_rule}' rule.")
         return gdf
 
     # Adopted from user's notebook: Normalize geometries to points
@@ -316,43 +329,102 @@ def fetch_shops_within_bbox(
 
 def find_shop_near_path(
     G: nx.Graph,
-    path_node_ids: List[int], # Expecting node IDs now
-    shops_gdf,
-    max_dist_m: float = 100.0,
-):
-    """Return the nearest shop (row) to the path within max_dist_m; else None."""
-    if shops_gdf is None or shops_gdf.empty or len(path_node_ids) < 2:
-        print("find_shop_near_path: No shops_gdf, empty shops_gdf, or path too short.")
-        return None
+    start_node: Tuple[float, float],
+    end_node: Tuple[float, float],
+    shop_tags: Dict[str, int],
+    tag_match_rule: str = 'any',
+    max_search_dist_m: int = 2000,
+) -> Dict:
+    if not G or start_node is None or end_node is None:
+        return {"error": "Invalid graph or start/end node."}
 
-    path_ls = _path_linestring(G, path_node_ids)
-    if path_ls.is_empty:
-        print("find_shop_near_path: Path LineString is empty.")
-        return None
+    try:
+        base_path_nodes = nx.shortest_path(G, source=start_node, target=end_node, weight="length")
+        base_path_coords = [(G.nodes[n]['x'], G.nodes[n]['y']) for n in base_path_nodes]
+    except (nx.NetworkXNoPath, nx.NodeNotFound) as e:
+        return {"error": f"Could not find a base path: {e}"}
 
-    # Project to metric space for distance checks
-    shop_points = [Point(pt.x, pt.y) for pt in shops_gdf["point_geom"].to_list()]
+    if not base_path_coords:
+        return {"error": "Base path has no coordinates."}
+
+    # Use the midpoint of the path to search for POIs
+    mid_index = len(base_path_coords) // 2
+    center_point_lon, center_point_lat = base_path_coords[mid_index]
     
-    if not shop_points:
-        print("find_shop_near_path: No valid shop points to project.")
-        return None
+    # Determine search radius based on path length, with a minimum and maximum
+    base_path_ls = LineString(base_path_coords)
+    # DEPRECATED: search_radius_m = max(200, min(int(base_path_ls.length * 0.1), 2000)) # 10% of path length, capped
+    search_radius_m = max_search_dist_m
+
+    all_found_pois = []
+    
+    tags_to_search = shop_tags
+    if not tags_to_search:
+        tags_to_search = {'convenience': 1} # Default to one convenience store if no tags are provided
+
+    for tag, count in tags_to_search.items():
+        if count <= 0:
+            continue
         
-    proj_shop_pts, tf = _project_to_local(shop_points)
-    proj_path = _project_linestring(path_ls, tf)
+        # Fetch POIs for the current tag, searching in both 'shop' and 'amenity' categories
+        pois_gdf = fetch_shops_from_point(
+            center_point=(center_point_lat, center_point_lon),
+            radius_m=search_radius_m,
+            tags={
+                "shop": [tag],
+                "amenity": [tag]
+            },
+            tag_match_rule='any' # POI can be a shop OR an amenity with the tag
+        )
 
-    # Compute distances and pick nearest
-    dists = np.array([proj_path.distance(p) for p in proj_shop_pts])  # meters in EPSG:3857
-    idx_min = int(np.argmin(dists))
-    dmin = float(dists[idx_min])
+        if pois_gdf.empty:
+            print(f"No POIs found for tag '{tag}'")
+            continue
 
-    print(f"find_shop_near_path: Nearest shop is {dmin:.2f} meters from path.")
+        # Find the nearest node in the graph for each POI
+        pois_gdf['nearest_node'] = pois_gdf.apply(
+            lambda row: _nearest_node(G, row.point_geom.x, row.point_geom.y), axis=1
+        )
+        pois_gdf = pois_gdf.dropna(subset=['nearest_node'])
 
-    if max_dist_m is not None and dmin > max_dist_m:
-        print(f"find_shop_near_path: Nearest shop ({dmin:.2f}m) exceeds max_dist_m ({max_dist_m}m).")
-        return None
+        if pois_gdf.empty:
+            print(f"No POIs for tag '{tag}' could be snapped to the graph.")
+            continue
 
-    # Return the original row (in lon/lat)
-    return shops_gdf.iloc[idx_min]
+        # Calculate distance from the base path to each POI's nearest node
+        # This is a simplification; a more accurate way would be to calculate path distance
+        poi_nodes = [Point(G.nodes[n]['x'], G.nodes[n]['y']) for n in pois_gdf['nearest_node']]
+        distances = [base_path_ls.distance(p) for p in poi_nodes]
+        pois_gdf['distance_to_path'] = distances
+        
+        # Sort by distance and take the top 'count'
+        pois_gdf = pois_gdf.sort_values(by='distance_to_path').head(count)
+        all_found_pois.append(pois_gdf)
+
+    if not all_found_pois:
+        return {
+            "note": "No shops found matching the criteria.",
+            "base_path": base_path_coords,
+            "route_u_shop_v": [],
+            "shop_points": [],
+        }
+
+    final_pois_gdf = pd.concat(all_found_pois)
+    
+    # Ensure 'osmid' is a column for deduplication
+    if 'osmid' not in final_pois_gdf.columns and 'osmid' in final_pois_gdf.index.names:
+        final_pois_gdf = final_pois_gdf.reset_index()
+
+    if 'osmid' in final_pois_gdf.columns:
+        final_pois_gdf = final_pois_gdf.drop_duplicates(subset=['osmid'])
+    else:
+        # If no osmid, we cannot reliably deduplicate, so we proceed with what we have
+        print("Warning: 'osmid' not found, cannot deduplicate POIs.")
+    
+    return {
+        "base_path_coords": base_path_coords,
+        "pois_gdf": final_pois_gdf,
+    }
 
 
 def route_via_nearby_shop(
@@ -360,185 +432,103 @@ def route_via_nearby_shop(
     start_lat: float,
     end_lon: float,
     end_lat: float,
-    bbox: Optional[Tuple[float, float, float, float]] = None,
-    place: str = "Philadelphia, PA, USA",
-    road_tags: Optional[Dict[str, Iterable[str]]] = None,
-    shop_tags: Optional[Dict[str, Iterable[str]]] = None,
-    max_shop_dist_m: float = 100.0,
-    G: Optional[nx.MultiDiGraph] = None, # Expecting MultiDiGraph from build_graph_segments
-):
-    """Build segmented graph, find shortest path, snap a nearby shop, and re-route."""
-    # Build/load the segmented graph over bbox/place. Allow passing a preloaded G to
-    # avoid rebuilding the graph repeatedly (faster for API servers).
-    if G is None:
-        print("Building graph...")
-        if bbox is None:
-            G = build_graph_segments(place=place, tags=road_tags or DEFAULT_ROAD_TAGS)
-            # derive bbox from graph nodes for shop query
-            xs = [d["x"] for _, d in G.nodes(data=True)]
-            ys = [d["y"] for _, d in G.nodes(data=True)]
-            if not xs or not ys:
-                raise ValueError("Graph built with no nodes; cannot derive bbox.")
-            west, east = min(xs), max(xs)
-            south, north = min(ys), max(ys)
-        else:
-            north, south, east, west = bbox
-            G = build_graph_segments(bbox=bbox, tags=road_tags or DEFAULT_ROAD_TAGS)
-        print(f"Graph built with {len(G.nodes)} nodes and {len(G.edges)} edges.")
-    else:
-        # If caller provided a graph G, derive a bbox from its nodes unless an explicit
-        # bbox was provided.
-        if bbox is None:
-            xs = [d["x"] for _, d in G.nodes(data=True)]
-            ys = [d["y"] for _, d in G.nodes(data=True)]
-            if not xs or not ys:
-                raise ValueError("Provided graph has no nodes; cannot derive bbox.")
-            west, east = min(xs), max(xs)
-            south, north = min(ys), max(ys)
-        else:
-            north, south, east, west = bbox
+    shop_tags: Dict[str, int],
+    tag_match_rule: str,
+    G: nx.Graph,
+    max_search_dist_m: int = 2000,
+) -> Dict:
+    start_node = _nearest_node(G, start_lon, start_lat)
+    end_node = _nearest_node(G, end_lon, end_lat)
+
+    if not start_node or not end_node:
+        return {"error": "Could not snap start or end points to the road network."}
+
+    # Find candidate POIs
+    path_info = find_shop_near_path(G, start_node, end_node, shop_tags, tag_match_rule, max_search_dist_m=max_search_dist_m)
+    if "error" in path_info or "pois_gdf" not in path_info or path_info["pois_gdf"].empty:
+        return path_info
+
+    base_path_coords = path_info["base_path_coords"]
+    pois_gdf = path_info["pois_gdf"]
+
+    waypoints = list(pois_gdf['nearest_node'])
     
-    print(f"Effective BBox for shop query: N={north:.4f}, S={south:.4f}, E={east:.4f}, W={west:.4f}")
-
-    # Snap start/end to graph nodes
-    u_node_id = _nearest_node(G, start_lon, start_lat)
-    v_node_id = _nearest_node(G, end_lon, end_lat)
-
-    start_node_coords = (G.nodes[u_node_id]['x'], G.nodes[u_node_id]['y'])
-    end_node_coords = (G.nodes[v_node_id]['x'], G.nodes[v_node_id]['y'])
-
-    print(f"Start snapped to node {u_node_id} ({start_node_coords[0]:.4f}, {start_node_coords[1]:.4f})")
-    print(f"End snapped to node {v_node_id} ({end_node_coords[0]:.4f}, {end_node_coords[1]:.4f})")
-
-
-    # Base shortest path
+    # --- Waypoint Ordering: Insertion Heuristic ---
+    # Project waypoints onto the base path and sort them by their order along the path.
+    # This prevents the inefficient zig-zagging of a simple nearest-neighbor TSP approx.
+    
     try:
-        base_path_node_ids = nx.shortest_path(G, u_node_id, v_node_id, weight="weight")
-        print(f"Base path found with {len(base_path_node_ids)} nodes.")
-    except nx.NetworkXNoPath:
-        print("No path found between start and end nodes.")
-        return {
-            "graph": G,
-            "u": start_node_coords,
-            "v": end_node_coords,
-            "u_node_id": u_node_id,
-            "v_node_id": v_node_id,
-            "base_path": [],
-            "shop_node_id": None,
-            "shop_point": None,
-            "shop_label": None,
-            "route_uv": [],
-            "route_u_shop_v": [],
-            "note": "No path found between start and end.",
-        }
+        base_path_nodes = nx.shortest_path(G, source=start_node, target=end_node, weight="length")
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        # Fallback to greedy if base path fails for some reason (should be rare)
+        base_path_nodes = []
 
-    # Get shops using the new point-based strategy.
-    
-    # Calculate midpoint for the search
-    center_lon = (start_lon + end_lon) / 2
-    center_lat = (start_lat + end_lat) / 2
-    center_point = (center_lat, center_lon) # OSMnx expects (lat, lon)
+    if base_path_nodes:
+        # Create a mapping from each node in the base path to its position (index)
+        node_to_pos = {node: i for i, node in enumerate(base_path_nodes)}
+        
+        # For each waypoint, find the closest node on the base path
+        waypoint_projections = {}
+        for wp in waypoints:
+            min_dist = float('inf')
+            closest_node_on_path = None
+            # This is a simple projection; could be improved with path distance
+            wp_geom = Point(G.nodes[wp]['x'], G.nodes[wp]['y'])
+            for node_on_path in base_path_nodes:
+                node_geom = Point(G.nodes[node_on_path]['x'], G.nodes[node_on_path]['y'])
+                dist = wp_geom.distance(node_geom)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_node_on_path = node_on_path
+            
+            if closest_node_on_path:
+                waypoint_projections[wp] = node_to_pos[closest_node_on_path]
 
-    shops = None
-    print("Searching for shops using point-based search around route midpoint...")
-    # Use a reasonable search radius, e.g., half the straight-line distance between start and end, but with min/max caps
-    geod = Geod(ellps="WGS84")
-    dist_m = geod.inv(start_lon, start_lat, end_lon, end_lat)[2]
-    radius_m = int(min(max(dist_m / 2, 1000), 5000)) # Search between 1km and 5km radius
-
-    shops = fetch_shops_from_point(
-        center_point=center_point,
-        radius_m=radius_m,
-        tags=shop_tags,
-    )
-    
-    if shops is None or shops.empty:
-        print("No shops found via point-based search. Falling back to synthetic waypoint.")
-
-
-    # --- Determine the waypoint to use ---
-    chosen_shop_poi = find_shop_near_path(G, base_path_node_ids, shops, max_dist_m=max_shop_dist_m)
-    
-    shop_node_id_for_routing = None
-    shop_point_for_display = None # This will hold the (lon, lat) of the chosen shop/waypoint
-    shop_label_for_display = None
-    note = None
-
-    if chosen_shop_poi is not None:
-        # A shop was found within max_dist_m
-        shop_point_for_display = (chosen_shop_poi["point_geom"].x, chosen_shop_poi["point_geom"].y)
-        shop_label_for_display = chosen_shop_poi.get("label", "shop")
-        shop_node_id_for_routing = _nearest_node(G, shop_point_for_display[0], shop_point_for_display[1])
-        print(f"Chosen shop: {shop_label_for_display} at ({shop_point_for_display[0]:.4f}, {shop_point_for_display[1]:.4f})")
-        print(f"Snapped to node {shop_node_id_for_routing} ({(G.nodes[shop_node_id_for_routing]['x']):.4f}, {(G.nodes[shop_node_id_for_routing]['y']):.4f})")
-        note = "Route via nearby shop."
-
+        # Sort waypoints based on their projected position on the base path
+        ordered_waypoints = sorted(waypoints, key=lambda wp: waypoint_projections.get(wp, float('inf')))
     else:
-        # No shop found within max_dist_m. Apply fallback logic.
-        path_ls = _path_linestring(G, base_path_node_ids)
-        if path_ls.is_empty:
-            note = "Path geometry empty; cannot determine waypoint."
-            # In this case, we won't have a shop point or path
-            return {
-                "graph": G, "u": start_node_coords, "v": end_node_coords,
-                "u_node_id": u_node_id, "v_node_id": v_node_id,
-                "base_path": base_path_node_ids, "shop_node_id": None,
-                "shop_point": None, "shop_label": None,
-                "route_uv": base_path_node_ids, "route_u_shop_v": base_path_node_ids,
-                "note": note,
-            }
-
-        midpt = path_ls.interpolate(0.5, normalized=True)
-        if shops is not None and not shops.empty:
-            # Shops exist, but none are close enough. Pick the closest one to the route midpoint.
-            print("No shops found within max_dist_m. Choosing closest shop to route midpoint.")
-            chosen_fallback_shop = shops.iloc[int(shops["point_geom"].distance(midpt).argmin())]
-            shop_point_for_display = (chosen_fallback_shop["point_geom"].x, chosen_fallback_shop["point_geom"].y)
-            shop_label_for_display = chosen_fallback_shop.get("label", "shop")
-            shop_node_id_for_routing = _nearest_node(G, shop_point_for_display[0], shop_point_for_display[1])
-            note = "No shops within max_dist_m; chose closest shop to path midpoint."
-            print(f"Fallback shop: {shop_label_for_display} at ({shop_point_for_display[0]:.4f}, {shop_point_for_display[1]:.4f})")
-            print(f"Snapped to node {shop_node_id_for_routing} ({(G.nodes[shop_node_id_for_routing]['x']):.4f}, {(G.nodes[shop_node_id_for_routing]['y']):.4f})")
-        else:
-            # No POIs available at all — make a synthetic waypoint at the route midpoint node
-            print("No POIs available at all. Inserting a synthetic waypoint on the route midpoint.")
-            shop_node_id_for_routing = _nearest_node(G, float(midpt.x), float(midpt.y))
-            shop_point_for_display = (G.nodes[shop_node_id_for_routing]['x'], G.nodes[shop_node_id_for_routing]['y'])
-            shop_label_for_display = "synthetic_waypoint"
-            note = "No POIs found; inserted a synthetic waypoint on the route."
-            print(f"Synthetic waypoint at ({(G.nodes[shop_node_id_for_routing]['x']):.4f}, {(G.nodes[shop_node_id_for_routing]['y']):.4f})")
-
-    # --- Compute the two-leg route via the determined waypoint ---
-    path_u_shop_v_ids = base_path_node_ids # Default to base path if waypoint routing fails or no waypoint
+        # Fallback to the old greedy method if no base path was found
+        ordered_waypoints = []
+        
+    # --- Path Construction ---
+    # Stitch together the path from start -> sorted_waypoints -> end
     
-    if shop_node_id_for_routing is not None:
+    path_segments = []
+    current_node = start_node
+    
+    # Path from start to each ordered waypoint
+    for waypoint in ordered_waypoints:
         try:
-            path_u_shop_ids = nx.shortest_path(G, u_node_id, shop_node_id_for_routing, weight="weight")
-            path_shop_v_ids = nx.shortest_path(G, shop_node_id_for_routing, v_node_id, weight="weight")
-            path_u_shop_v_ids = path_u_shop_ids[:-1] + path_shop_v_ids  # avoid duplicate meeting node
-            print(f"Re-routed via waypoint: {len(path_u_shop_v_ids)} nodes.")
-        except nx.NetworkXNoPath as e:
-            print(f"Could not re-route via waypoint ({shop_label_for_display}): {e}. Using direct path.")
-            path_u_shop_v_ids = base_path_node_ids # Fallback to direct path
-            note = f"Could not re-route via {shop_label_for_display}. Using direct path. {note or ''}".strip()
-    else:
-        # If no shop_node_id_for_routing was ever determined (e.g., base path was empty)
-        print("No valid waypoint for routing. Using direct path.")
+            segment = nx.shortest_path(G, source=current_node, target=waypoint, weight='length')
+            path_segments.extend(segment[:-1]) # Avoid duplicating nodes
+            current_node = waypoint
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            print(f"Warning: Could not find path to waypoint {waypoint}. Skipping.")
+            continue
 
+    # Add the final leg from the last waypoint to the destination
+    try:
+        final_segment = nx.shortest_path(G, source=current_node, target=end_node, weight='length')
+        path_segments.extend(final_segment)
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return {"error": "Could not find a path from the last waypoint to the destination."}
+
+
+    full_via_path_coords = [(G.nodes[n]['x'], G.nodes[n]['y']) for n in path_segments]
+    
+    # Get coordinates and labels for the visited waypoints in order
+    ordered_shop_points = []
+    for wp_node in ordered_waypoints:
+        poi_row = pois_gdf[pois_gdf['nearest_node'] == wp_node].iloc[0]
+        point_coords = (poi_row.point_geom.x, poi_row.point_geom.y)
+        label = poi_row.label
+        ordered_shop_points.append((point_coords, label))
 
     return {
-        "graph": G,
-        "u": start_node_coords, # Original start coords (lon, lat)
-        "v": end_node_coords,   # Original end coords (lon, lat)
-        "u_node_id": u_node_id, # Snapped start node ID
-        "v_node_id": v_node_id, # Snapped end node ID
-        "base_path": base_path_node_ids, # Node IDs for base path
-        "shop_node_id": shop_node_id_for_routing, # Snapped shop node ID for display
-        "shop_point": shop_point_for_display, # Original shop/waypoint coords (lon, lat) for display
-        "shop_label": shop_label_for_display,
-        "route_uv": base_path_node_ids, # Node IDs for direct route
-        "route_u_shop_v": path_u_shop_v_ids, # Node IDs for via-waypoint route
-        "note": note,
+        "base_path": base_path_coords,
+        "route_u_shop_v": full_via_path_coords,
+        "shop_points": ordered_shop_points,
+        "note": f"Found and routed through {len(ordered_waypoints)} waypoints.",
     }
 
 # ---------------------------
@@ -589,8 +579,7 @@ def plot_route_with_waypoint(result, figsize=(10, 10)):
     v_lonlat = result["v"] # Original end coords
     u_node_id = result["u_node_id"] # Snapped start node ID
     v_node_id = result["v_node_id"] # Snapped end node ID
-    shop_node_id = result["shop_node_id"] # Snapped shop node ID
-    shop_point_lonlat = result["shop_point"] # Original shop coords
+    shop_points_lonlat = result.get("shop_points", []) # List of original shop coords
     shop_label = result["shop_label"]
 
     route_uv_ids = result["route_uv"]
@@ -608,18 +597,20 @@ def plot_route_with_waypoint(result, figsize=(10, 10)):
 
     # Pointers: start, shop, end
     ax.scatter([G.nodes[u_node_id]['x']], [G.nodes[u_node_id]['y']], s=80, marker="o", color="green", edgecolor="black", zorder=5)      # start
-    if shop_node_id is not None and shop_point_lonlat is not None:
-        ax.scatter([G.nodes[shop_node_id]['x']], [G.nodes[shop_node_id]['y']], s=100, marker="^", color="red", edgecolor="black", zorder=5)  # shop node
-        # Optionally, plot the actual shop point if it's different from the snapped node
-        if (abs(shop_point_lonlat[0] - G.nodes[shop_node_id]['x']) > 1e-5 or 
-            abs(shop_point_lonlat[1] - G.nodes[shop_node_id]['y']) > 1e-5):
-            ax.scatter([shop_point_lonlat[0]], [shop_point_lonlat[1]], s=30, marker="*", color="magenta", zorder=4, label="Original Shop POI")
+    
+    # Plot all waypoints
+    for point in shop_points_lonlat:
+        # Find the nearest node on the graph to this point for plotting the marker
+        node_id = _nearest_node(G, point[0], point[1])
+        if node_id:
+            ax.scatter([G.nodes[node_id]['x']], [G.nodes[node_id]['y']], s=100, marker="^", color="red", edgecolor="black", zorder=5)
+            ax.scatter([point[0]], [point[1]], s=30, marker="*", color="magenta", zorder=4, label="Original POI")
+
     ax.scatter([G.nodes[v_node_id]['x']], [G.nodes[v_node_id]['y']], s=80, marker="X", color="purple", edgecolor="black", zorder=5)      # end
 
     # Labels
     ax.text(G.nodes[u_node_id]['x'], G.nodes[u_node_id]['y'], " Start", fontsize=10, verticalalignment='bottom')
-    if shop_node_id is not None:
-        ax.text(G.nodes[shop_node_id]['x'], G.nodes[shop_node_id]['y'], f" {shop_label}", fontsize=10, verticalalignment='bottom')
+    # Labeling multiple waypoints can get crowded, so we'll skip it for now
     ax.text(G.nodes[v_node_id]['x'], G.nodes[v_node_id]['y'], " End", fontsize=10, verticalalignment='bottom')
 
     # Add a title and optional note

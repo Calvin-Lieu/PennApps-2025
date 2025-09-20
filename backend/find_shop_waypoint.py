@@ -166,7 +166,7 @@ def fetch_shops_from_point(
     # Use a specific set of tags for relevant shops, inspired by the user's notebook.
     if tags is None:
         tags = {
-            "shop": ["supermarket", "convenience", "grocery", "general", "cafe", "bakery"],
+            "shop": ["supermarket", "convenience", "grocery", "general", "cafe"],
             "amenity": ["fast_food", "cafe", "vending_machine", "drinking_water", "restaurant", "pub"],
         }
 

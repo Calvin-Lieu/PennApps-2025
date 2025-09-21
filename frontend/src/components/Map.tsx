@@ -1644,7 +1644,7 @@ export default function Map({
       {/* Weather Box - Bottom Right (above legend) */}
       <div style={{
         position: 'absolute',
-        bottom: 120,
+        bottom: 129,
         right: 20,
         background: 'rgba(255,255,255,0.92)',
         padding: '12px',

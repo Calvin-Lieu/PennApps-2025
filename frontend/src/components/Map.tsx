@@ -299,7 +299,7 @@ export default function Map({
 
     try {
       console.log("🚰 Fetching nearby water stops...");
-      const response = await fetch('http://localhost:8000/waypoints/near_path', {
+  const response = await fetch('http://localhost:8000/waypoints/near_path', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -307,7 +307,7 @@ export default function Map({
         body: JSON.stringify({
           path: pathCoords,
           max_detour_meters: maxDetour,
-          waypoint_types: ['water'] // Only fetch water fountains
+          waypoint_types: ['water'] // Nearby fountains as fallback visualization
         })
       });
 
@@ -333,26 +333,36 @@ export default function Map({
 
     waypoints.forEach((waypoint) => {
       const [lat, lng] = waypoint.coordinates;
+
+      // Humanize names like "drinking_water" → "Drinking water"
+      const humanize = (s?: string) => {
+        if (!s) return 'Water stop';
+        const t = String(s).replace(/_/g, ' ').trim();
+        if (t.toLowerCase() === 'drinking water' || t.toLowerCase() === 'drinking_water') return 'Drinking water';
+        // Title-case basic words
+        return t.replace(/\w\S*/g, (w) => w.charAt(0).toUpperCase() + w.slice(1));
+      };
+      const displayName = humanize(waypoint.name);
       
       // Create custom icon for water fountains
       const icon = L.divIcon({
         html: '💧',
-        iconSize: [20, 20],
-        iconAnchor: [10, 10],
-        popupAnchor: [0, -10],
+        iconSize: [32, 32],
+        iconAnchor: [16, 28],
+        popupAnchor: [0, -28],
         className: 'water-waypoint-icon'
       });
 
       const marker = L.marker([lat, lng], { icon })
         .bindPopup(`
           <div style="font-size: 12px; line-height: 1.4;">
-            <b>💧 ${waypoint.name}</b><br>
-            <small>${waypoint.amenity || 'Water fountain'}</small><br>
+            <b>💧 ${displayName}</b><br>
+            <small>${humanize(waypoint.amenity) || 'Water stop'}</small><br>
             ${waypoint.opening_hours ? `<small>Hours: ${waypoint.opening_hours}</small><br>` : ''}
             <small>Lat: ${lat.toFixed(6)}, Lng: ${lng.toFixed(6)}</small>
           </div>
         `)
-        .bindTooltip(`💧 ${waypoint.name}`, { 
+        .bindTooltip(`💧 ${displayName}`, { 
           permanent: false, 
           direction: 'top',
           offset: [0, -20]
@@ -444,10 +454,16 @@ export default function Map({
 
     // Add waypoints if enabled
     if (includeWaterStops) {
-      const waypoints = await findNearbyWaypoints(pathCoords, maxDetourDistance);
-      pathStateRef.current.waypoints = waypoints;
-      setPathUIState(prev => ({ ...prev, waypoints }));
-      displayWaypoints(waypoints);
+      // Prefer backend-provided chosen waypoint if present; otherwise optionally show nearby fountains
+      const existing = pathStateRef.current.waypoints || [];
+      if (existing.length > 0) {
+        displayWaypoints(existing);
+      } else {
+        const waypoints = await findNearbyWaypoints(pathCoords, maxDetourDistance);
+        pathStateRef.current.waypoints = waypoints;
+        setPathUIState(prev => ({ ...prev, waypoints }));
+        displayWaypoints(waypoints);
+      }
     }
   }, [ready, includeWaterStops, maxDetourDistance, findNearbyWaypoints, displayWaypoints]);
 
@@ -478,11 +494,16 @@ export default function Map({
         end_lng: endPoint[1]
       };
 
-      const payload = useShadeRouting ? {
+      const payload: any = useShadeRouting ? {
         ...basePayload,
         time: currentHour,
         shade_penalty: shadePenalty
-      } : basePayload;
+      } : { ...basePayload };
+
+      // Ask backend to route via a water stop/store when enabled
+      if (includeWaterStops) {
+        payload.add_water_stop = true;
+      }
 
       console.log("📡 Calling backend API:", endpoint, payload);
       const response = await fetch(`http://localhost:8000/${endpoint}`, {
@@ -525,19 +546,48 @@ export default function Map({
         };
       }
 
+      // Normalize backend-provided waypoint (if any) into our Waypoint shape
+      let backendWaypoints: Waypoint[] = [];
+      if (includeWaterStops && Array.isArray(data.waypoints) && data.waypoints.length > 0) {
+        backendWaypoints = data.waypoints.map((w: any, idx: number) => {
+          const lat = w.lat ?? w.latitude ?? (Array.isArray(w.coordinates) ? w.coordinates[0] : undefined);
+          const lon = w.lon ?? w.lng ?? w.longitude ?? (Array.isArray(w.coordinates) ? w.coordinates[1] : undefined);
+          const name = w.name || 'Water Stop';
+          const id = w.id || `${name}-${lat}-${lon}-${idx}`;
+          return {
+            id,
+            type: w.type || 'water',
+            name,
+            coordinates: [lat, lon],
+            longitude: lon,
+            latitude: lat,
+            amenity: w.amenity || '',
+            shop: w.shop || '',
+            opening_hours: w.opening_hours || '',
+            website: w.website || '',
+            phone: w.phone || ''
+          } as Waypoint;
+        }).filter((wp: any) => Number.isFinite(wp.coordinates?.[0]) && Number.isFinite(wp.coordinates?.[1]));
+      }
+
       pathStateRef.current = {
         ...pathStateRef.current,
         path: pathCoords,
         loading: false,
         error: null,
         routeStats,
-        waypoints: [] // Reset waypoints
+        waypoints: backendWaypoints // Waypoints from backend if any
       };
       setPathUIState({ ...pathStateRef.current });
 
       console.log("✅ Path computed, displaying on map with shade analysis");
       // Display path with shade analysis
       if (pathCoords.length > 0) {
+        // If backend chose a waypoint, render it immediately (always show it since route uses it)
+        if (backendWaypoints.length > 0) {
+          console.log("📍 Rendering backend-chosen waypoint(s):", backendWaypoints.length);
+          displayWaypoints(backendWaypoints);
+        }
         await displayPathWithShadeAnalysis(pathCoords);
       }
 
@@ -920,7 +970,7 @@ export default function Map({
                     setIncludeWaterStops(e.target.checked);
                   }}
                 />
-                Show water fountains
+                Add water stop waypoint
               </label>
             </div>
             
@@ -1042,7 +1092,7 @@ export default function Map({
                   
                   {includeWaterStops && pathUIState.waypoints && pathUIState.waypoints.length > 0 && (
                     <div style={{ marginTop: 4, paddingTop: 4, borderTop: '1px solid #eee' }}>
-                      Water fountains: {pathUIState.waypoints.length}
+                      Water stops: {pathUIState.waypoints.length}
                     </div>
                   )}
                   
@@ -1104,7 +1154,7 @@ export default function Map({
         }}>
           Paths colored by shade coverage
           {includeWaterStops && (
-            <div style={{ marginTop: 4 }}>Water fountains shown as droplet icons</div>
+            <div style={{ marginTop: 4 }}>Water stops shown as droplet icons</div>
           )}
         </div>
       </div>
@@ -1121,7 +1171,7 @@ export default function Map({
           .water-waypoint-icon {
             background: transparent !important;
             border: none !important;
-            font-size: 16px;
+            font-size: 28px;
             display: flex !important;
             align-items: center !important;
             justify-content: center !important;

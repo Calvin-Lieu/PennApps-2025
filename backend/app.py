@@ -52,6 +52,66 @@ app.add_middleware(
 G: Optional[nx.Graph] = None
 geod = Geod(ellps="WGS84")
 
+# Helper: compute a rough centroid of the loaded graph (lat, lon)
+def _graph_centroid() -> Optional[Tuple[float, float]]:
+    global G
+    if G is None:
+        return None
+    try:
+        # Sample up to first 2000 nodes for speed
+        total = 0
+        sum_lat = 0.0
+        sum_lon = 0.0
+        for i, node in enumerate(G.nodes()):
+            lon, lat = node  # nodes are (lon, lat)
+            sum_lat += float(lat)
+            sum_lon += float(lon)
+            total += 1
+            if i >= 1999:
+                break
+        if total > 0:
+            return (sum_lat / total, sum_lon / total)
+    except Exception:
+        pass
+    return None
+
+# Normalize a path to [[lat, lng]] even if input was [[lng, lat]].
+def _normalize_path_latlng(path: List[List[float]]) -> List[List[float]]:
+    if not path:
+        return path
+    # If any point clearly violates lat/lon ranges, try swapping
+    def swap(p):
+        return [p[1], p[0]]
+
+    # Build two interpretations
+    as_is = path
+    swapped = [swap(p) for p in path]
+
+    # Prefer the interpretation whose points are closer to the graph's centroid
+    centroid = _graph_centroid()
+    if centroid is None:
+        # Fallback heuristic: if majority have abs(lat) > abs(lng), it's likely swapped
+        votes_swapped = sum(1 for p in as_is if abs(p[0]) > abs(p[1]))
+        return swapped if votes_swapped > len(as_is) / 2 else as_is
+
+    def mean_distance_m(points: List[List[float]]) -> float:
+        try:
+            dists = [geodesic((p[0], p[1]), centroid).meters for p in points]
+            return sum(dists) / max(1, len(dists))
+        except Exception:
+            return float('inf')
+
+    d_as_is = mean_distance_m(as_is)
+    d_swapped = mean_distance_m(swapped)
+    if d_swapped + 1e-6 < d_as_is:
+        # Debug logging for analysis
+        try:
+            print(f"Normalized path by swapping coordinate order; mean dist to centroid improved {d_as_is:.1f}m -> {d_swapped:.1f}m")
+        except Exception:
+            pass
+        return swapped
+    return as_is
+
 @app.on_event("startup")
 async def _startup_load_data():
     """Load graph and waypoint data at startup."""
@@ -238,6 +298,9 @@ def find_waypoints_near_path(path: List[List[float]], max_detour: int, waypoint_
     Returns:
         List of nearby waypoints with distance information
     """
+    # Ensure path is in [lat, lng]
+    path = _normalize_path_latlng(path)
+
     waypoints = load_waypoints_data()
     if not waypoints:
         return []
@@ -339,8 +402,9 @@ async def waypoints_near_path(req: WaypointsNearPathRequest) -> Dict[str, Any]:
         return {"error": "Path must contain at least 2 points"}
     
     try:
+        normalized_path = _normalize_path_latlng(req.path)
         nearby_waypoints = find_waypoints_near_path(
-            req.path, 
+            normalized_path, 
             req.max_detour_meters,
             req.waypoint_types
         )
@@ -357,11 +421,59 @@ async def waypoints_near_path(req: WaypointsNearPathRequest) -> Dict[str, Any]:
             "type_counts": type_counts,
             "max_detour_meters": req.max_detour_meters,
             "types_requested": req.waypoint_types,
-            "path_segments": len(req.path) - 1
+            "path_segments": len(normalized_path) - 1
         }
         
     except Exception as e:
         return {"error": f"Failed to find waypoints: {str(e)}"}
+
+
+# Convenience GET variant so you can test in a browser without POST
+@app.get("/waypoints/near_path")
+async def waypoints_near_path_get(
+    path: str,  # JSON-encoded [[lat,lng], ...] or [[lng,lat], ...]
+    max_detour_meters: int = 100,
+    waypoint_types: Optional[str] = "water,store",
+) -> Dict[str, Any]:
+    """GET helper for nearby waypoints. Provide `path` as a JSON-encoded array of coordinate pairs.
+
+    Examples (URL-encoded):
+      /waypoints/near_path?path=%5B%5B39.95%2C-75.16%5D%2C%5B39.96%2C-75.17%5D%5D&max_detour_meters=150&waypoint_types=water,store
+    """
+    try:
+        coords = json.loads(path)
+        if not isinstance(coords, list) or not coords or not isinstance(coords[0], list):
+            return {"error": "path must be a JSON array of [lat,lng] (or [lng,lat]) pairs"}
+    except Exception as e:
+        return {"error": f"Invalid path JSON: {e}"}
+
+    types_list: List[str] = []
+    if waypoint_types:
+        types_list = [t.strip() for t in waypoint_types.split(',') if t.strip()]
+
+    try:
+        normalized_path = _normalize_path_latlng(coords)
+        nearby_waypoints = find_waypoints_near_path(
+            normalized_path,
+            max_detour_meters,
+            types_list or ["water", "store"],
+        )
+
+        type_counts: Dict[str, int] = {}
+        for wp in nearby_waypoints:
+            wp_type = wp.get('type', 'unknown')
+            type_counts[wp_type] = type_counts.get(wp_type, 0) + 1
+
+        return {
+            "waypoints": nearby_waypoints,
+            "total_found": len(nearby_waypoints),
+            "type_counts": type_counts,
+            "max_detour_meters": max_detour_meters,
+            "types_requested": types_list or ["water", "store"],
+            "path_segments": len(normalized_path) - 1,
+        }
+    except Exception as e:
+        return {"error": f"Failed to find waypoints: {e}"}
 
 
 @app.get("/waypoints/all")
@@ -604,77 +716,13 @@ async def shortest_path(req: ShortestPathRequest) -> Dict[str, Any]:
         return {"error": "Could not find nearest nodes"}
     
     try:
-        # If user requested a water stop, try routing via a shop/water waypoint first
-        if getattr(req, 'add_water_stop', False):
-            helper = _get_find_path_with_water_stop()
-            if helper is None:
-                print("add_water_stop requested but helper not available; falling back to direct route")
-            else:
-                try:
-                    path_ls, waypoint_infos, full_path_nodes = helper(
-                        G,
-                        (req.start_lat, req.start_lng),
-                        (req.end_lat, req.end_lng)
-                    )
-                except Exception as e:
-                    print(f"find_path_with_water_stop failed: {e}")
-                    path_ls, waypoint_infos, full_path_nodes = None, None, None
-
-                if full_path_nodes:
-                    # Convert node ids to (lon,lat) then to [[lat,lng]]
-                    coords_lonlat = [(G.nodes[n]['x'], G.nodes[n]['y']) for n in full_path_nodes]
-                    path_coords = lonlat_to_latlng(coords_lonlat)
-
-                    # Compute total distance using original weights
-                    total_distance = 0.0
-                    shaded_segments = 0
-                    total_shade_length = 0.0
-                    total_path_length = 0.0
-                    sample_edge = next(iter(G.edges(data=True)), None)
-                    has_shade_data = sample_edge and 'shade_fraction_9' in sample_edge[2]
-                    for i in range(len(full_path_nodes) - 1):
-                        u, v = full_path_nodes[i], full_path_nodes[i + 1]
-                        if G.has_edge(u, v):
-                            edge_data = G[u][v]
-                            w = edge_data.get('weight', edge_data.get('length', 0))
-                            total_distance += w
-                            if has_shade_data:
-                                total_path_length += edge_data.get('weight', 0)
-                                total_shade_length += edge_data.get('shade_length_9', 0)
-                                if edge_data.get('is_shaded_9', False):
-                                    shaded_segments += 1
-
-                    result = {
-                        "path": path_coords,
-                        "start_node": [start_node[1], start_node[0]],  # [lat, lng]
-                        "end_node": [end_node[1], end_node[0]],        # [lat, lng]
-                        "total_distance_m": total_distance,
-                        "num_segments": len(full_path_nodes) - 1,
-                        "shade_mode": "standard",
-                        "analysis_time": "9:00",
-                        "routed_via_water_stop": True,
-                        "waypoints": waypoint_infos or [],
-                    }
-                    if has_shade_data and total_path_length > 0:
-                        shade_percentage = (total_shade_length / total_path_length * 100)
-                        result.update({
-                            "shaded_segments": shaded_segments,
-                            "shade_percentage": round(shade_percentage, 1),
-                            "total_shade_length_m": round(total_shade_length, 1),
-                            "original_distance_m": total_distance,
-                            "shade_aware_distance_m": total_distance,
-                            "shade_penalty_applied": 1.0,
-                            "shade_penalty_added_m": 0.0,
-                        })
-                    return result
-
-        # Compute shortest path using NetworkX
+        # Compute initial direct path using NetworkX
         path_nodes = nx.shortest_path(G, start_node, end_node, weight='weight')
         
         # Convert path to coordinate list for frontend
         path_coords = lonlat_to_latlng(path_nodes)
         
-        # Calculate total distance
+        # Calculate total distance for direct path
         total_distance = nx.shortest_path_length(G, start_node, end_node, weight='weight')
         
         # Calculate shade statistics for the path (using 9am data as default)
@@ -711,6 +759,49 @@ async def shortest_path(req: ShortestPathRequest) -> Dict[str, Any]:
             "shade_mode": "standard",
             "analysis_time": "9:00"  # Default time for standard routing
         }
+
+        # If user requested water stop, pick a waypoint on/near the initial path and route via it
+        if getattr(req, 'add_water_stop', False):
+            try:
+                # Build lat,lng polyline from direct path for selection
+                path_latlng = path_coords
+                candidates = find_waypoints_near_path(path_latlng, max_detour=100, waypoint_types=['water', 'store'])
+                chosen = candidates[0] if candidates else None
+                if chosen:
+                    wp_lat = float(chosen.get('lat') or chosen.get('latitude') or chosen['coordinates'][0])
+                    wp_lng = float(chosen.get('lon') or chosen.get('lng') or chosen.get('longitude') or chosen['coordinates'][1])
+                    wp_node = find_nearest_node(wp_lat, wp_lng)
+                    if wp_node is not None:
+                        p1 = nx.shortest_path(G, start_node, wp_node, weight='weight')
+                        p2 = nx.shortest_path(G, wp_node, end_node, weight='weight')
+                        via_nodes = p1[:-1] + p2
+                        # Graph nodes are stored as (lon, lat); lonlat_to_latlng expects that
+                        via_coords = lonlat_to_latlng(via_nodes)
+                        via_dist = nx.shortest_path_length(G, start_node, wp_node, weight='weight') + \
+                                   nx.shortest_path_length(G, wp_node, end_node, weight='weight')
+
+                        # Replace original result with via-stop result
+                        result.update({
+                            "path": via_coords,
+                            "total_distance_m": via_dist,
+                            "num_segments": len(via_nodes) - 1,
+                            "routed_via_water_stop": True,
+                            "waypoints": [{
+                                "id": chosen.get('id'),
+                                "type": chosen.get('type') or 'water',
+                                "name": chosen.get('name') or 'Water Stop',
+                                "lat": wp_lat,
+                                "lon": wp_lng,
+                                "coordinates": [wp_lat, wp_lng],
+                                "amenity": chosen.get('amenity',''),
+                                "shop": chosen.get('shop',''),
+                                "opening_hours": chosen.get('opening_hours',''),
+                                "website": chosen.get('website',''),
+                                "phone": chosen.get('phone',''),
+                            }]
+                        })
+            except Exception as e:
+                print(f"add_water_stop selection failed (standard): {e}")
         
         # Add shade statistics if available
         if has_shade_data:
@@ -806,43 +897,13 @@ async def shortest_path_shade_aware(req: ShadeAwarePathRequest) -> Dict[str, Any
             new_weight = calculate_shade_aware_weight(edge_attrs, req.shade_penalty, is_daylight, req.time)
             edge_attrs['shade_aware_weight'] = new_weight
         
-        # If user requested a water stop, try to find a waypoint and force path via it
-        used_water_stop = False
-        used_waypoints = []
-        helper = _get_find_path_with_water_stop()
-        if getattr(req, 'add_water_stop', False) and helper is not None:
-            shop_wp = None
-            try:
-                _ls, waypoint_infos, _nodes = helper(
-                    G, (req.start_lat, req.start_lng), (req.end_lat, req.end_lng)
-                )
-                if waypoint_infos:
-                    used_waypoints = waypoint_infos
-                    shop_wp = waypoint_infos[0]
-            except Exception as e:
-                print(f"find_path_with_water_stop failed (shade): {e}")
-                shop_wp = None
-
-            if shop_wp is not None:
-                shop_node = find_nearest_node(shop_wp["lat"], shop_wp["lon"]) if isinstance(shop_wp, dict) else None
-                if shop_node is not None:
-                    p1 = nx.shortest_path(temp_graph, start_node, shop_node, weight='shade_aware_weight')
-                    p2 = nx.shortest_path(temp_graph, shop_node, end_node, weight='shade_aware_weight')
-                    # Combine, avoiding duplicate of the junction node
-                    path_nodes = p1[:-1] + p2
-                    used_water_stop = True
-                else:
-                    path_nodes = nx.shortest_path(temp_graph, start_node, end_node, weight='shade_aware_weight')
-            else:
-                path_nodes = nx.shortest_path(temp_graph, start_node, end_node, weight='shade_aware_weight')
-        else:
-            # Compute shortest path using shade-aware weights
-            path_nodes = nx.shortest_path(temp_graph, start_node, end_node, weight='shade_aware_weight')
+        # Compute initial shortest path using shade-aware weights
+        path_nodes = nx.shortest_path(temp_graph, start_node, end_node, weight='shade_aware_weight')
         
         # Convert path to coordinate list for frontend
         path_coords = lonlat_to_latlng(path_nodes)
         
-        # Calculate distances using both original and shade-aware weights
+        # Calculate distances for direct path
         original_distance = nx.shortest_path_length(G, start_node, end_node, weight='weight')
         shade_aware_distance = nx.shortest_path_length(temp_graph, start_node, end_node, weight='shade_aware_weight')
         
@@ -871,6 +932,55 @@ async def shortest_path_shade_aware(req: ShadeAwarePathRequest) -> Dict[str, Any
                     shaded_segments += 1
         
         shade_percentage = (total_shade_length / total_path_length * 100) if total_path_length > 0 else 0
+
+        routed_via = False
+        used_waypoints: List[Dict[str, Any]] = []
+        # If requested, select a waypoint along the initial path and rebuild the path via it
+        if getattr(req, 'add_water_stop', False):
+            try:
+                candidates = find_waypoints_near_path(path_coords, max_detour=100, waypoint_types=['water', 'store'])
+                chosen = candidates[0] if candidates else None
+                if chosen:
+                    wp_lat = float(chosen.get('lat') or chosen.get('latitude') or chosen['coordinates'][0])
+                    wp_lng = float(chosen.get('lon') or chosen.get('lng') or chosen.get('longitude') or chosen['coordinates'][1])
+                    wp_node = find_nearest_node(wp_lat, wp_lng)
+                    if wp_node is not None:
+                        p1 = nx.shortest_path(temp_graph, start_node, wp_node, weight='shade_aware_weight')
+                        p2 = nx.shortest_path(temp_graph, wp_node, end_node, weight='shade_aware_weight')
+                        path_nodes = p1[:-1] + p2
+                        path_coords = lonlat_to_latlng(path_nodes)
+                        # Recompute distances and stats for via-stop path
+                        shade_aware_distance = nx.shortest_path_length(temp_graph, start_node, wp_node, weight='shade_aware_weight') + \
+                                              nx.shortest_path_length(temp_graph, wp_node, end_node, weight='shade_aware_weight')
+                        # Recompute shade stats
+                        total_shade_length = 0
+                        total_path_length = 0
+                        shaded_segments = 0
+                        for i in range(len(path_nodes) - 1):
+                            n1, n2 = path_nodes[i], path_nodes[i + 1]
+                            if temp_graph.has_edge(n1, n2):
+                                ed = temp_graph[n1][n2]
+                                total_path_length += ed.get('weight', 0)
+                                total_shade_length += ed.get(shade_length_key, ed.get('shade_length_9', 0))
+                                if ed.get(is_shaded_key, ed.get('is_shaded_9', False)):
+                                    shaded_segments += 1
+                        shade_percentage = (total_shade_length / total_path_length * 100) if total_path_length > 0 else 0
+                        routed_via = True
+                        used_waypoints = [{
+                            "id": chosen.get('id'),
+                            "type": chosen.get('type') or 'water',
+                            "name": chosen.get('name') or 'Water Stop',
+                            "lat": wp_lat,
+                            "lon": wp_lng,
+                            "coordinates": [wp_lat, wp_lng],
+                            "amenity": chosen.get('amenity',''),
+                            "shop": chosen.get('shop',''),
+                            "opening_hours": chosen.get('opening_hours',''),
+                            "website": chosen.get('website',''),
+                            "phone": chosen.get('phone',''),
+                        }]
+            except Exception as e:
+                print(f"add_water_stop selection failed (shade): {e}")
         
         return {
             "path": path_coords,
@@ -886,7 +996,7 @@ async def shortest_path_shade_aware(req: ShadeAwarePathRequest) -> Dict[str, Any
             "shade_percentage": round(shade_percentage, 1),
             "total_shade_length_m": round(total_shade_length, 1),
             "shade_penalty_added_m": round(shade_aware_distance - original_distance, 1),
-            "routed_via_water_stop": used_water_stop,
+            "routed_via_water_stop": routed_via,
             "waypoints": used_waypoints,
         }
         

@@ -1336,7 +1336,7 @@ export default function Map({
                 checked={routeOpts.avoid_stairs}
                 onChange={(e) => setRouteOpts(o => ({ ...o, avoid_stairs: e.target.checked }))}
               />
-              Avoid stairs/steps
+              Avoid stairs
             </label>
             <label style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
               <input
@@ -1360,16 +1360,7 @@ export default function Map({
                 checked={routeOpts.wheelchair}
                 onChange={(e) => setRouteOpts(o => ({ ...o, wheelchair: e.target.checked }))}
               />
-              Wheelchair-friendly (where data allows)
-            </label>
-            {/* NEW: Uneven terrain option */}
-            <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <input
-                type="checkbox"
-                checked={routeOpts.avoid_uneven}
-                onChange={(e) => setRouteOpts(o => ({ ...o, avoid_uneven: e.target.checked }))}
-              />
-              Avoid uneven terrain (cobblestone, rocks)
+              Wheelchair-friendly
             </label>
           </div>
           {useShadeRouting && (

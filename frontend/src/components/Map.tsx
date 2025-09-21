@@ -256,6 +256,7 @@ export default function Map({
   const [showTreeShadows, setShowTreeShadows] = useState(false); // Toggle for tree shadows
   const showTreeShadowsRef = useRef(false); // Ref to track current state
   const fetchTokenRef = useRef(0);
+  const handleMapClickRef = useRef<(e: L.LeafletMouseEvent) => void>(() => { });
   const retryAttemptRef = useRef<string | null>(null); // Track current path being retried
 
   // Use refs instead of state to avoid re-renders for pathfinding
@@ -1023,6 +1024,10 @@ export default function Map({
     }
   }, [useShadeRouting]);
 
+  useEffect(() => {
+    handleMapClickRef.current = handleMapClick;
+  }, [handleMapClick]);
+
   // attach click handler after map created
   useEffect(() => {
     console.log("TestMap useEffect triggered - Map setup");
@@ -1061,7 +1066,9 @@ export default function Map({
     }
 
     // Add click handler for placing markers (now supports pathfinding)
-    map.on('click', handleMapClick);
+    // map.on('click', handleMapClick);
+    const onClick = (e: L.LeafletMouseEvent) => handleMapClickRef.current(e);
+    map.on('click', onClick);
 
     // Test ray-casting algorithm on map ready
     map.whenReady(() => {
@@ -1078,8 +1085,8 @@ export default function Map({
     return () => {
       console.log("TestMap cleanup - removing map");
 
-      map.off('click', handleMapClick);
-
+      // map.off('click', handleMapClick);
+      map.off('click', onClick);
       // Clear layers
       if (edgeLayerRef.current) {
         try {
@@ -1131,7 +1138,7 @@ export default function Map({
       // Remove map
       map.remove();
     };
-  }, [handleMapClick]); // Include handleMapClick in dependencies
+  }, []); // Include handleMapClick in dependencies
 
   // Update shade time when hour changes
   useEffect(() => {

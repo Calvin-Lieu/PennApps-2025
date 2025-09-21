@@ -176,9 +176,9 @@ Temporal shadow analysis across different hours of the day, demonstrating how sh
 
 Aggregated shade coverage analysis that combines temporal shadow data across all time periods to create comprehensive shade profiles for each street segment. This visualization represents the culmination of our shadow analysis pipeline, showing average shade coverage that enables optimal route planning throughout the day.
 
-## Development Highlights
+### Development Highlights
 
-### These are completed components that demonstrate core capabilities but are not yet fully integrated into the main ShadeNav system:
+These are completed components that demonstrate core capabilities but are not yet fully integrated into the main ShadeNav system:
 
 - **Tree Detection System**: High-resolution NDVI/NDWI analysis with 5m grid scoring, successfully identifying 700+ urban trees.  
 

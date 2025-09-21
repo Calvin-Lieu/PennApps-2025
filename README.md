@@ -181,11 +181,11 @@ Aggregated shade coverage analysis that combines temporal shadow data across all
 These are completed components that demonstrate core capabilities but are not yet fully integrated into the main ShadeNav system:
 
 - **Tree Detection System**: Used the Google Earth Engine API with multi-spectral vegetation indices (NDVI, NDWI, GNDVI) for precise tree location detection and size estimation, successfully identifying 700+ urban trees in downtown Philadelhia with geometric shadow computation and pathway intersection analysis.
+  
+![Tree Detection Visualization](figs/tree_detection_grid_updated.png)
+*Visualization of the 5m grid tree detection system showing vegetation density scoring across downtown Philadelphia.*
 
 The tree detection system uses Google Earth Engine API to process Sentinel-2 satellite imagery with NDVI, NDWI, and GNDVI vegetation indices at 5m resolution, creating a dense grid where each cell's vegetation density score serves as a proxy for tree size estimation. Once trees are detected and sized, the system performs geometric shadow computation using solar ray tracing algorithms that calculate shadow patterns based on sun position, tree height, and canopy geometry throughout the day. These computed tree shadows are then intersected with urban pathway networks using polygon-polyline intersection algorithms to determine shade coverage percentages for each route segment, enabling the routing system to weight pathways based on their shade coverage for optimal pedestrian comfort.
-
-![Tree Detection Visualization](figs/tree_detection_grid.png)
-*Visualization of the 5m grid tree detection system showing vegetation density scoring across downtown Philadelphia.*
 
 ![Interactive Shade Analysis Map](figs/shade_analysis_map.png)
 *Interactive map interface showing tree shadows, pathway intersection analysis, and shade-aware routing.*  

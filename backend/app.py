@@ -51,6 +51,29 @@ app.add_middleware(
 # Global graph and geodesic helper
 G: Optional[nx.Graph] = None
 geod = Geod(ellps="WGS84")
+WATER_MAX_DETOUR_M = 150  # default detour threshold for via-stop routing
+
+def _is_water_waypoint(wp: Dict[str, Any]) -> bool:
+    t = str(wp.get('type','')).lower()
+    amenity = str(wp.get('amenity','')).lower()
+    shop = str(wp.get('shop','')).lower()
+    tags = wp.get('tags') or {}
+    tag_amenity = str(tags.get('amenity','')).lower()
+    tag_shop = str(tags.get('shop','')).lower()
+    name = str(wp.get('name','')).lower()
+    water_like = {'drinking_water','water','water_point'}
+    if t in water_like or amenity in water_like or tag_amenity in water_like:
+        return True
+    if name and any(k in name for k in ('water','fountain','refill')):
+        return True
+    return False
+
+def _choose_preferred_waypoint(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not candidates:
+        return None
+    # Prefer true water over generic stores when available
+    waters = [c for c in candidates if _is_water_waypoint(c)]
+    return waters[0] if waters else candidates[0]
 
 # Helper: compute a rough centroid of the loaded graph (lat, lon)
 def _graph_centroid() -> Optional[Tuple[float, float]]:
@@ -630,6 +653,7 @@ class ShortestPathRequest(BaseModel):
     end_lat: float
     end_lng: float
     add_water_stop: Optional[bool] = False
+    water_max_detour_m: Optional[int] = None
 
 
 class ShadeAwarePathRequest(BaseModel):
@@ -640,6 +664,7 @@ class ShadeAwarePathRequest(BaseModel):
     time: Optional[int] = 9  # Hour 0-23, default 9am
     shade_penalty: Optional[float] = 1.0  # Penalty factor for shaded areas
     add_water_stop: Optional[bool] = False
+    water_max_detour_m: Optional[int] = None
 
 
 @app.get("/health")
@@ -765,8 +790,10 @@ async def shortest_path(req: ShortestPathRequest) -> Dict[str, Any]:
             try:
                 # Build lat,lng polyline from direct path for selection
                 path_latlng = path_coords
-                candidates = find_waypoints_near_path(path_latlng, max_detour=100, waypoint_types=['water', 'store'])
-                chosen = candidates[0] if candidates else None
+                detour = int(getattr(req, 'water_max_detour_m', 0) or WATER_MAX_DETOUR_M)
+                candidates = find_waypoints_near_path(path_latlng, max_detour=detour, waypoint_types=['water', 'store'])
+                chosen = _choose_preferred_waypoint(candidates)
+                print(f"[water-stop standard] candidates={len(candidates)} chosen={'yes' if chosen else 'no'}")
                 if chosen:
                     wp_lat = float(chosen.get('lat') or chosen.get('latitude') or chosen['coordinates'][0])
                     wp_lng = float(chosen.get('lon') or chosen.get('lng') or chosen.get('longitude') or chosen['coordinates'][1])
@@ -800,6 +827,10 @@ async def shortest_path(req: ShortestPathRequest) -> Dict[str, Any]:
                                 "phone": chosen.get('phone',''),
                             }]
                         })
+                    else:
+                        print("[water-stop standard] nearest node to waypoint not found")
+                else:
+                    print("[water-stop standard] no waypoint chosen")
             except Exception as e:
                 print(f"add_water_stop selection failed (standard): {e}")
         
@@ -856,7 +887,8 @@ async def shortest_path_shade_aware(req: ShadeAwarePathRequest) -> Dict[str, Any
             start_lat=req.start_lat,
             start_lng=req.start_lng,
             end_lat=req.end_lat,
-            end_lng=req.end_lng
+            end_lng=req.end_lng,
+            add_water_stop=getattr(req, 'add_water_stop', False)
         )
         result = await shortest_path(standard_req)
         if isinstance(result, dict) and 'path' in result:
@@ -938,8 +970,10 @@ async def shortest_path_shade_aware(req: ShadeAwarePathRequest) -> Dict[str, Any
         # If requested, select a waypoint along the initial path and rebuild the path via it
         if getattr(req, 'add_water_stop', False):
             try:
-                candidates = find_waypoints_near_path(path_coords, max_detour=100, waypoint_types=['water', 'store'])
-                chosen = candidates[0] if candidates else None
+                detour = int(getattr(req, 'water_max_detour_m', 0) or WATER_MAX_DETOUR_M)
+                candidates = find_waypoints_near_path(path_coords, max_detour=detour, waypoint_types=['water', 'store'])
+                chosen = _choose_preferred_waypoint(candidates)
+                print(f"[water-stop shade] candidates={len(candidates)} chosen={'yes' if chosen else 'no'}")
                 if chosen:
                     wp_lat = float(chosen.get('lat') or chosen.get('latitude') or chosen['coordinates'][0])
                     wp_lng = float(chosen.get('lon') or chosen.get('lng') or chosen.get('longitude') or chosen['coordinates'][1])
@@ -979,6 +1013,10 @@ async def shortest_path_shade_aware(req: ShadeAwarePathRequest) -> Dict[str, Any
                             "website": chosen.get('website',''),
                             "phone": chosen.get('phone',''),
                         }]
+                    else:
+                        print("[water-stop shade] nearest node to waypoint not found")
+                else:
+                    print("[water-stop shade] no waypoint chosen")
             except Exception as e:
                 print(f"add_water_stop selection failed (shade): {e}")
         

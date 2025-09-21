@@ -28,10 +28,33 @@ const endIcon = new L.Icon({
   className: "end-marker",
 });
 
+// Water fountain icon
+const waterIcon = new L.Icon({
+  iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png',
+  iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png',
+  shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
+  iconSize: [20, 32], iconAnchor: [10, 32], popupAnchor: [1, -24], shadowSize: [32, 32],
+  className: "water-marker",
+});
+
 // ---------- Types ----------
 type Pt = { lat: number; lng: number };
 export type Edge = { id: string; a: Pt; b: Pt };
 export type EdgeResult = { id: string; shadePct: number; shaded: boolean; nSamples: number };
+
+interface Waypoint {
+  id: string;
+  type: string;
+  name: string;
+  coordinates: [number, number]; // [lat, lng]
+  longitude: number;
+  latitude: number;
+  amenity: string;
+  shop: string;
+  opening_hours: string;
+  website: string;
+  phone: string;
+}
 
 function metersToLatDeg(m: number) { return m / 110540; }
 function metersToLngDeg(m: number, lat: number) { return m / (111320 * Math.cos(lat * Math.PI / 180)); }
@@ -70,6 +93,7 @@ interface PathState {
     totalShadeLength: number;
     shadePenaltyAdded: number;
   };
+  waypoints?: Waypoint[]; // Add waypoints to path state
 }
 
 export default function Map({
@@ -85,12 +109,15 @@ export default function Map({
   const shadeRef = useRef<any>(null);
   const edgeLayerRef = useRef<L.LayerGroup | null>(null);
   const pathLayerRef = useRef<L.LayerGroup | null>(null);
+  const waypointLayerRef = useRef<L.LayerGroup | null>(null); // New layer for waypoints
   const markersRef = useRef<L.Marker[]>([]);
   const [testToggle, setTestToggle] = useState(false);
   const [ready, setReady] = useState(false);
   const [currentHour, setCurrentHour] = useState(9);
-  const [shadePenalty, setShadePenalty] = useState(1.0); // Shade avoidance factor
-  const [useShadeRouting, setUseShadeRouting] = useState(true); // Toggle for shade-aware routing
+  const [shadePenalty, setShadePenalty] = useState(1.0);
+  const [useShadeRouting, setUseShadeRouting] = useState(true);
+  const [includeWaterStops, setIncludeWaterStops] = useState(false); // New state for water stops
+  const [maxDetourDistance, setMaxDetourDistance] = useState(100); // Max detour in meters
   const fetchTokenRef = useRef(0);
 
   // Use refs instead of state to avoid re-renders for pathfinding
@@ -100,7 +127,8 @@ export default function Map({
     path: [],
     loading: false,
     error: null,
-    routeStats: undefined
+    routeStats: undefined,
+    waypoints: []
   });
   const [pathUIState, setPathUIState] = useState<PathState>({
     startPoint: null,
@@ -108,19 +136,21 @@ export default function Map({
     path: [],
     loading: false,
     error: null,
-    routeStats: undefined
+    routeStats: undefined,
+    waypoints: []
   });
 
-  // Refs for reactive recomputation system (this might be the source of lag!)
-  const penaltyUpdateTimeoutRef = useRef<number | null>(null); // Debounce timer
-  const prevShadeRoutingRef = useRef(useShadeRouting); // Track routing mode changes
-  const prevCurrentHourRef = useRef(currentHour); // Track time changes
+  // Refs for reactive recomputation system
+  const penaltyUpdateTimeoutRef = useRef<number | null>(null);
+  const prevShadeRoutingRef = useRef(useShadeRouting);
+  const prevCurrentHourRef = useRef(currentHour);
+  const prevIncludeWaterStopsRef = useRef(includeWaterStops); // Track water stop changes
   const lastDateRef = useRef(new Date());
 
-  // Building data caching system (final optimization that might cause lag)
-  const buildingDataCacheRef = useRef<any[]>([]); // Cache building data
-  const lastBoundsRef = useRef<string>(''); // Track when we need to refetch buildings
-  const shadeOptionsRef = useRef<any>(null); // Cache the shade options to avoid recreating getFeatures
+  // Building data caching system
+  const buildingDataCacheRef = useRef<any[]>([]);
+  const lastBoundsRef = useRef<string>('');
+  const shadeOptionsRef = useRef<any>(null);
 
   // Build ShadeMap options using correct API (with comprehensive caching)
   const buildShadeOptions = (when: Date) => {
@@ -152,7 +182,7 @@ export default function Map({
         await new Promise((r) => setTimeout(r, 200)); // debounce small pans
         
         if (my !== fetchTokenRef.current) {
-          console.log("🏢 Fetch cancelled due to newer request");
+          console.log("🢠 Fetch cancelled due to newer request");
           return [];
         }
 
@@ -162,9 +192,9 @@ export default function Map({
         // Create a bounds key to check if we need to refetch
         const boundsKey = `${north.toFixed(4)},${south.toFixed(4)},${east.toFixed(4)},${west.toFixed(4)}`;
         
-        console.log("🏢 Current bounds:", boundsKey);
-        console.log("🏢 Last bounds:", lastBoundsRef.current);
-        console.log("🏢 Cached buildings count:", buildingDataCacheRef.current.length);
+        console.log("🢠 Current bounds:", boundsKey);
+        console.log("🢠 Last bounds:", lastBoundsRef.current);
+        console.log("🢠 Cached buildings count:", buildingDataCacheRef.current.length);
         
         // Return cached data if bounds haven't changed significantly
         if (lastBoundsRef.current === boundsKey && buildingDataCacheRef.current.length > 0) {
@@ -263,6 +293,74 @@ export default function Map({
     }
   };
 
+  // Function to find nearby waypoints along a path
+  const findNearbyWaypoints = useCallback(async (pathCoords: [number, number][], maxDetour: number = 100): Promise<Waypoint[]> => {
+    if (pathCoords.length === 0) return [];
+
+    try {
+      console.log("🚰 Fetching nearby water stops...");
+      const response = await fetch('http://localhost:8000/waypoints/near_path', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          path: pathCoords,
+          max_detour_meters: maxDetour,
+          waypoint_types: ['water'] // Only fetch water fountains
+        })
+      });
+
+      if (!response.ok) {
+        console.warn("Failed to fetch waypoints:", response.statusText);
+        return [];
+      }
+
+      const data = await response.json();
+      console.log("🚰 Found waypoints:", data.waypoints?.length || 0);
+      
+      return data.waypoints || [];
+    } catch (error) {
+      console.error("Error fetching waypoints:", error);
+      return [];
+    }
+  }, []);
+
+  // Function to display waypoints on the map
+  const displayWaypoints = useCallback((waypoints: Waypoint[]) => {
+    const waypointLayer = waypointLayerRef.current!;
+    waypointLayer.clearLayers();
+
+    waypoints.forEach((waypoint) => {
+      const [lat, lng] = waypoint.coordinates;
+      
+      // Create custom icon for water fountains
+      const icon = L.divIcon({
+        html: '💧',
+        iconSize: [20, 20],
+        iconAnchor: [10, 10],
+        popupAnchor: [0, -10],
+        className: 'water-waypoint-icon'
+      });
+
+      const marker = L.marker([lat, lng], { icon })
+        .bindPopup(`
+          <div style="font-size: 12px; line-height: 1.4;">
+            <b>💧 ${waypoint.name}</b><br>
+            <small>${waypoint.amenity || 'Water fountain'}</small><br>
+            ${waypoint.opening_hours ? `<small>Hours: ${waypoint.opening_hours}</small><br>` : ''}
+            <small>Lat: ${lat.toFixed(6)}, Lng: ${lng.toFixed(6)}</small>
+          </div>
+        `)
+        .bindTooltip(`💧 ${waypoint.name}`, { 
+          permanent: false, 
+          direction: 'top',
+          offset: [0, -20]
+        })
+        .addTo(waypointLayer);
+    });
+  }, []);
+
   // Function to display path with gradient shade analysis
   const displayPathWithShadeAnalysis = useCallback(async (pathCoords: [number, number][]) => {
     if (!ready || !shadeRef.current || !mapRef.current) return;
@@ -343,7 +441,15 @@ export default function Map({
         .bindTooltip(`Segment ${i + 1}: ${(pct * 100).toFixed(0)}% shaded (${result?.nSamples || 0} samples)`)
         .addTo(pathLayer);
     }
-  }, [ready]);
+
+    // Add waypoints if enabled
+    if (includeWaterStops) {
+      const waypoints = await findNearbyWaypoints(pathCoords, maxDetourDistance);
+      pathStateRef.current.waypoints = waypoints;
+      setPathUIState(prev => ({ ...prev, waypoints }));
+      displayWaypoints(waypoints);
+    }
+  }, [ready, includeWaterStops, maxDetourDistance, findNearbyWaypoints, displayWaypoints]);
 
   // Unified function to compute and display path with backend API calls
   const computeAndDisplayPath = useCallback(async () => {
@@ -424,7 +530,8 @@ export default function Map({
         path: pathCoords,
         loading: false,
         error: null,
-        routeStats
+        routeStats,
+        waypoints: [] // Reset waypoints
       };
       setPathUIState({ ...pathStateRef.current });
 
@@ -445,7 +552,7 @@ export default function Map({
     }
   }, [useShadeRouting, currentHour, shadePenalty, displayPathWithShadeAnalysis]);
 
-  // Handle map clicks for pathfinding (basic version without backend)
+  // Handle map clicks for pathfinding
   const handleMapClick = useCallback(async (e: L.LeafletMouseEvent) => {
     if (pathStateRef.current.loading) return;
     const { lat, lng } = e.latlng;
@@ -497,7 +604,9 @@ export default function Map({
       
       // Clear path layer (which includes all pathfinding markers)
       const pathLayer = pathLayerRef.current!;
+      const waypointLayer = waypointLayerRef.current!;
       pathLayer.clearLayers();
+      waypointLayer.clearLayers(); // Clear waypoints too
       markersRef.current = [];
 
       pathStateRef.current = {
@@ -506,7 +615,8 @@ export default function Map({
         path: [],
         loading: false,
         error: null,
-        routeStats: undefined
+        routeStats: undefined,
+        waypoints: []
       };
 
       // Update UI state
@@ -517,7 +627,7 @@ export default function Map({
       marker.bindPopup("Start Point");
       markersRef.current.push(marker);
     }
-  }, []);
+  }, [computeAndDisplayPath]);
 
   // attach click handler after map created
   useEffect(() => {
@@ -543,6 +653,9 @@ export default function Map({
 
     // Create path layer for pathfinding
     pathLayerRef.current = L.layerGroup().addTo(map);
+
+    // Create waypoint layer for water stops
+    waypointLayerRef.current = L.layerGroup().addTo(map);
 
     // Add click handler for placing markers (now supports pathfinding)
     map.on('click', handleMapClick);
@@ -576,6 +689,13 @@ export default function Map({
           console.warn('Error removing path layer:', e);
         }
       }
+      if (waypointLayerRef.current) {
+        try {
+          map.removeLayer(waypointLayerRef.current);
+        } catch (e) {
+          console.warn('Error removing waypoint layer:', e);
+        }
+      }
       
       // Clear markers
       markersRef.current.forEach(marker => {
@@ -596,7 +716,7 @@ export default function Map({
         }
       }
       
-      // Clear all caches (building data caching cleanup)
+      // Clear all caches
       buildingDataCacheRef.current = [];
       lastBoundsRef.current = '';
       shadeOptionsRef.current = null;
@@ -605,7 +725,7 @@ export default function Map({
       // Remove map
       map.remove();
     };
-  }, [handleMapClick]); // Include handleMapClick in dependencies
+  }, [handleMapClick]);
 
   // Update shade time when hour changes
   useEffect(() => {
@@ -627,7 +747,7 @@ export default function Map({
     console.log("TestMap useEffect triggered - Toggle changed:", testToggle);
   }, [testToggle]);
 
-  // Reactive recomputation when shade settings change (SUSPECTED LAG SOURCE!)
+  // Reactive recomputation when shade settings change
   useEffect(() => {
     console.log("🔄 Reactive recomputation useEffect triggered");
     if (pathStateRef.current.startPoint && pathStateRef.current.endPoint) {
@@ -636,17 +756,19 @@ export default function Map({
         clearTimeout(penaltyUpdateTimeoutRef.current);
       }
       
-      // Check if shade routing mode or time changed (needs longer delay for shadow recomputation)
+      // Check if shade routing mode, time, or water stops changed
       const shadeRoutingChanged = prevShadeRoutingRef.current !== useShadeRouting;
       const timeChanged = prevCurrentHourRef.current !== currentHour;
+      const waterStopsChanged = prevIncludeWaterStopsRef.current !== includeWaterStops;
       
-      console.log("🔄 Change detection:", { shadeRoutingChanged, timeChanged });
+      console.log("🔄 Change detection:", { shadeRoutingChanged, timeChanged, waterStopsChanged });
       
       prevShadeRoutingRef.current = useShadeRouting;
       prevCurrentHourRef.current = currentHour;
+      prevIncludeWaterStopsRef.current = includeWaterStops;
       
       // Longer delay when shade routing toggles or time changes to allow shadow recomputation,
-      // shorter delay for penalty adjustments
+      // shorter delay for penalty adjustments or water stop changes
       const delay = (shadeRoutingChanged || timeChanged) ? 800 : 150;
       
       console.log("🔄 Setting recomputation timer with delay:", delay + "ms");
@@ -655,7 +777,7 @@ export default function Map({
         computeAndDisplayPath();
       }, delay);
     }
-  }, [useShadeRouting, shadePenalty, currentHour, computeAndDisplayPath]);
+  }, [useShadeRouting, shadePenalty, currentHour, includeWaterStops, computeAndDisplayPath]);
 
   // Classify edges by sampling the ShadeMap canvas
   async function classify({
@@ -786,6 +908,40 @@ export default function Map({
               />
             </div>
           )}
+
+          {/* Water stops controls */}
+          <div style={{ borderTop: '1px solid #ddd', paddingTop: 8, marginTop: 8 }}>
+            <div style={{ marginBottom: 6 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 12 }}>
+                <input
+                  type="checkbox"
+                  checked={includeWaterStops}
+                  onChange={(e) => {
+                    setIncludeWaterStops(e.target.checked);
+                  }}
+                />
+                Show water fountains
+              </label>
+            </div>
+            
+            {includeWaterStops && (
+              <div style={{ fontSize: 12 }}>
+                <div style={{ marginBottom: 4 }}>Max detour: {maxDetourDistance}m</div>
+                <input
+                  type="range"
+                  min={50}
+                  max={500}
+                  step={25}
+                  value={maxDetourDistance}
+                  onChange={(e) => {
+                    const newDistance = parseInt(e.target.value, 10);
+                    setMaxDetourDistance(newDistance);
+                  }}
+                  style={{ width: '100%' }}
+                />
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -818,24 +974,24 @@ export default function Map({
         }
       }}>
         {!ready && (
-          <div style={{ textAlign: 'center', color: '#007cba' }}>⏳ Loading shadows...</div>
+          <div style={{ textAlign: 'center', color: '#007cba' }}>Loading shadows...</div>
         )}
         {ready && !pathUIState.startPoint && (
-          <div style={{ textAlign: 'center', color: '#666' }}>🗺️ Click to set start</div>
+          <div style={{ textAlign: 'center', color: '#666' }}>Click to set start</div>
         )}
         {ready && pathUIState.startPoint && !pathUIState.endPoint && (
-          <div style={{ textAlign: 'center', color: '#666' }}>📍 Click to set destination</div>
+          <div style={{ textAlign: 'center', color: '#666' }}>Click to set destination</div>
         )}
         {pathUIState.loading && (
-          <div style={{ textAlign: 'center', color: '#007cba' }}>⏳ Computing path...</div>
+          <div style={{ textAlign: 'center', color: '#007cba' }}>Computing path...</div>
         )}
         {pathUIState.error && (
-          <div style={{ color: 'red', textAlign: 'center' }}>❌ {pathUIState.error}</div>
+          <div style={{ color: 'red', textAlign: 'center' }}>{pathUIState.error}</div>
         )}
         {pathUIState.path.length > 0 && ready && (
           <div>
             <div style={{ fontWeight: 'bold', marginBottom: 8, textAlign: 'center' }}>
-              ✅ Path Found
+              Path Found
             </div>
             
             {/* Compact view */}
@@ -845,6 +1001,9 @@ export default function Map({
                   `${pathUIState.routeStats.shadeAwareDistance.toFixed(0)}m • ${currentHour.toString().padStart(2, '0')}:00` :
                   `${pathUIState.path.length - 1} segments`
                 }
+                {includeWaterStops && pathUIState.waypoints && pathUIState.waypoints.length > 0 && (
+                  <span> • {pathUIState.waypoints.length} water stops</span>
+                )}
               </div>
             </div>
 
@@ -857,29 +1016,36 @@ export default function Map({
             }}>
               {pathUIState.routeStats ? (
                 <>
-                  <div>🎯 Distance: {pathUIState.routeStats.shadeAwareDistance.toFixed(0)}m</div>
+                  <div>Distance: {pathUIState.routeStats.shadeAwareDistance.toFixed(0)}m</div>
                   
                   {pathUIState.routeStats.shadeMode === 'daylight' ? (
                     <>
-                      <div>🌳 Shaded: {pathUIState.routeStats.totalShadeLength.toFixed(0)}m</div>
-                      <div>☀️ Unshaded: {(pathUIState.routeStats.shadeAwareDistance - pathUIState.routeStats.totalShadeLength).toFixed(0)}m</div>
-                      <div>📍 Shortest Path: {pathUIState.routeStats.originalDistance.toFixed(0)}m</div>
-                      <div>⏱️ Time: {pathUIState.routeStats.analysisTime} ({pathUIState.routeStats.shadeMode})</div>
-                      <div>⚖️ Penalty: +{pathUIState.routeStats.shadePenaltyAdded.toFixed(0)}m ({pathUIState.routeStats.shadePenalty}x)</div>
+                      <div>Shaded: {pathUIState.routeStats.totalShadeLength.toFixed(0)}m</div>
+                      <div>Unshaded: {(pathUIState.routeStats.shadeAwareDistance - pathUIState.routeStats.totalShadeLength).toFixed(0)}m</div>
+                      <div>Shortest Path: {pathUIState.routeStats.originalDistance.toFixed(0)}m</div>
+                      <div>Time: {pathUIState.routeStats.analysisTime} ({pathUIState.routeStats.shadeMode})</div>
+                      <div>Penalty: +{pathUIState.routeStats.shadePenaltyAdded.toFixed(0)}m ({pathUIState.routeStats.shadePenalty}x)</div>
                     </>
                   ) : pathUIState.routeStats.shadeMode === 'standard' ? (
                     <>
-                      <div>🌳 Shaded: {pathUIState.routeStats.totalShadeLength ? pathUIState.routeStats.totalShadeLength.toFixed(0) : '0'}m</div>
-                      <div>☀️ Unshaded: {pathUIState.routeStats.totalShadeLength ? (pathUIState.routeStats.shadeAwareDistance - pathUIState.routeStats.totalShadeLength).toFixed(0) : pathUIState.routeStats.shadeAwareDistance.toFixed(0)}m</div>
-                      <div>⏱️ Time: {currentHour.toString().padStart(2, '0')}:00 (standard)</div>
+                      <div>Shaded: {pathUIState.routeStats.totalShadeLength ? pathUIState.routeStats.totalShadeLength.toFixed(0) : '0'}m</div>
+                      <div>Unshaded: {pathUIState.routeStats.totalShadeLength ? (pathUIState.routeStats.shadeAwareDistance - pathUIState.routeStats.totalShadeLength).toFixed(0) : pathUIState.routeStats.shadeAwareDistance.toFixed(0)}m</div>
+                      <div>Time: {currentHour.toString().padStart(2, '0')}:00 (standard)</div>
                     </>
                   ) : (
                     <>
-                      <div>📍 Shortest Path: {pathUIState.routeStats.originalDistance.toFixed(0)}m</div>
-                      <div>⏱️ Time: {pathUIState.routeStats.analysisTime} ({pathUIState.routeStats.shadeMode})</div>
-                      <div>🌙 Night mode - no shade penalties</div>
+                      <div>Shortest Path: {pathUIState.routeStats.originalDistance.toFixed(0)}m</div>
+                      <div>Time: {pathUIState.routeStats.analysisTime} ({pathUIState.routeStats.shadeMode})</div>
+                      <div>Night mode - no shade penalties</div>
                     </>
                   )}
+                  
+                  {includeWaterStops && pathUIState.waypoints && pathUIState.waypoints.length > 0 && (
+                    <div style={{ marginTop: 4, paddingTop: 4, borderTop: '1px solid #eee' }}>
+                      Water fountains: {pathUIState.waypoints.length}
+                    </div>
+                  )}
+                  
                   <div style={{ marginTop: 8, fontSize: 11, color: '#999', textAlign: 'center' }}>
                     Click anywhere to start over
                   </div>
@@ -926,8 +1092,8 @@ export default function Map({
           fontSize: 10,
           color: '#666'
         }}>
-          <span>☀️ Unshaded (Hot)</span>
-          <span>🌳 Shaded (Cool)</span>
+          <span>Unshaded (Hot)</span>
+          <span>Shaded (Cool)</span>
         </div>
         
         <div style={{ 
@@ -937,10 +1103,13 @@ export default function Map({
           textAlign: 'center' 
         }}>
           Paths colored by shade coverage
+          {includeWaterStops && (
+            <div style={{ marginTop: 4 }}>Water fountains shown as droplet icons</div>
+          )}
         </div>
       </div>
 
-      {/* Style for hover effects - using global CSS */}
+      {/* Style for hover effects and water waypoints */}
       <style dangerouslySetInnerHTML={{
         __html: `
           .info-panel:hover .compact-info {
@@ -948,6 +1117,15 @@ export default function Map({
           }
           .info-panel:hover .expanded-info {
             display: block !important;
+          }
+          .water-waypoint-icon {
+            background: transparent !important;
+            border: none !important;
+            font-size: 16px;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.3);
           }
         `
       }} />

@@ -8,26 +8,61 @@ import os
 from pyproj import Geod
 import pickle
 from contextlib import asynccontextmanager
+# Add these imports to the top of app.py
+import json
+from geopy.distance import geodesic
+from typing import List, Tuple, Optional, Dict, Any
+import os
+from pathlib import Path
+from math import radians, cos
+from importlib import import_module
 
-# Global graph variable
+# Lazy loader for optional helper
+def _get_find_path_with_water_stop():
+    try:
+        return globals().get('find_path_with_water_stop_cached')
+    except Exception:
+        pass
+    func = None
+    try:
+        mod = import_module('backend.find_shop_waypoint')
+        func = getattr(mod, 'find_path_with_water_stop', None)
+    except Exception:
+        try:
+            mod = import_module('find_shop_waypoint')
+            func = getattr(mod, 'find_path_with_water_stop', None)
+        except Exception:
+            func = None
+    globals()['find_path_with_water_stop_cached'] = func
+    return func
+
+# Initialize FastAPI early so route decorators below can bind to it
+app = FastAPI(title="PennApps Demo Backend")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global graph and geodesic helper
 G: Optional[nx.Graph] = None
 geod = Geod(ellps="WGS84")
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Load the segmented graph on startup."""
+@app.on_event("startup")
+async def _startup_load_data():
+    """Load graph and waypoint data at startup."""
     global G
-    # Try to load enhanced graph first, fallback to original
     enhanced_graph_path = os.path.join(os.path.dirname(__file__), "data", "graph_segments_with_shade.gpickle")
     original_graph_path = os.path.join(os.path.dirname(__file__), "data", "graph_segments.gpickle")
-    
     try:
         if os.path.exists(enhanced_graph_path):
             with open(enhanced_graph_path, "rb") as f:
                 G = pickle.load(f)
             print(f"Loaded enhanced graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-            # Check if shade data is available
             sample_edge = next(iter(G.edges(data=True)), None)
             if sample_edge and 'shade_fraction_9' in sample_edge[2]:
                 print("✅ Shade data available for enhanced pathfinding")
@@ -41,19 +76,407 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"Failed to load graph: {e}")
         G = None
+    # Always attempt to load waypoint data
+    load_waypoints_data()
+
+# Add this after the existing models in app.py
+
+class WaypointsNearPathRequest(BaseModel):
+    path: List[List[float]]  # List of [lat, lng] coordinates
+    max_detour_meters: Optional[int] = 100
+    waypoint_types: Optional[List[str]] = ['water', 'store']  # Types to include
+
+
+# Global waypoints cache
+waypoints_cache: Optional[List[Dict[str, Any]]] = None
+
+def load_waypoints_data():
+    """Load waypoints from JSON, supporting multiple filenames/locations and structures."""
+    global waypoints_cache
+
+    if waypoints_cache is not None:
+        return waypoints_cache
+
+    base_dir = os.path.dirname(__file__)
+    # Support both singular/plural filenames and common locations
+    candidate_paths = [
+        # relative to CWD
+        "waypoint_data.json",
+        "waypoints_data.json",
+        "backend/waypoint_data.json",
+        "backend/waypoints_data.json",
+        "data/waypoint_data.json",
+        "data/waypoints_data.json",
+        # relative to backend module dir
+        os.path.join(base_dir, "waypoint_data.json"),
+        os.path.join(base_dir, "waypoints_data.json"),
+        os.path.join(base_dir, "data", "waypoint_data.json"),
+        os.path.join(base_dir, "data", "waypoints_data.json"),
+    ]
+
+    tried = []
+    for path in candidate_paths:
+        tried.append(path)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # Accept both list-of-waypoints or dict with lists
+            waypoints: list = []
+            if isinstance(data, list):
+                waypoints = data
+                print(f"ℹ️ Waypoints JSON is a list with {len(waypoints)} items")
+            elif isinstance(data, dict):
+                if "waypoints" in data and isinstance(data["waypoints"], list):
+                    waypoints = data["waypoints"]
+                    print(f"ℹ️ Using 'waypoints' key with {len(waypoints)} items")
+                else:
+                    # Merge all list values across keys
+                    merged: list = []
+                    for k, v in data.items():
+                        if isinstance(v, list):
+                            merged.extend(v)
+                    waypoints = merged
+                    print(f"ℹ️ Merged {len(waypoints)} items from dict keys: {', '.join([k for k,v in data.items() if isinstance(v, list)])}")
+
+            waypoints_cache = waypoints if waypoints is not None else []
+            print(f"📍 Loaded {len(waypoints_cache)} waypoints from {path}")
+            return waypoints_cache
+        except Exception as e:
+            print(f"Error loading waypoints from {path}: {e}")
+            continue
+
+    print("⚠️ No waypoints data found. Checked:")
+    for p in tried:
+        print(f"  - {p}")
+    print("Run waypoint_pathfinding.py to generate data or place waypoint_data.json in backend/.")
+    waypoints_cache = []
+    return waypoints_cache
+
+
+@app.get("/waypoints/reload")
+async def reload_waypoints() -> Dict[str, Any]:
+    """Clear the in-memory cache and reload waypoints from disk."""
+    global waypoints_cache
+    waypoints_cache = None
+    data = load_waypoints_data()
+    # Return a quick summary
+    types = {}
+    for wp in data:
+        t = str(wp.get('type', 'unknown')).lower()
+        types[t] = types.get(t, 0) + 1
+    return {
+        "reloaded": True,
+        "total": len(data),
+        "type_counts": types,
+    }
+
+
+def point_to_line_distance(point: Tuple[float, float], line_start: Tuple[float, float], line_end: Tuple[float, float]) -> float:
+    """
+    Calculate the shortest distance from a point to a line segment using geodesic distance.
+    
+    Args:
+        point: (lat, lng) of the point
+        line_start: (lat, lng) of line segment start
+        line_end: (lat, lng) of line segment end
+        
+    Returns:
+        Distance in meters
+    """
+    # Convert to meters using geodesic distance
+    def distance_m(p1, p2):
+        return geodesic(p1, p2).meters
+    
+    # If line segment is actually a point
+    if line_start == line_end:
+        return distance_m(point, line_start)
+    
+    # Calculate distances
+    d_start_end = distance_m(line_start, line_end)
+    d_start_point = distance_m(line_start, point)
+    d_end_point = distance_m(line_end, point)
+    
+    # Use dot product to find projection
+    # Convert lat/lng to approximate meters for calculation
+    lat_to_m = 111320  # meters per degree latitude (approximate)
+    lng_to_m = 111320 * abs(cos(radians((line_start[0] + line_end[0]) / 2)))
+    
+    # Vector from start to end
+    dx = (line_end[1] - line_start[1]) * lng_to_m
+    dy = (line_end[0] - line_start[0]) * lat_to_m
+    
+    # Vector from start to point
+    px = (point[1] - line_start[1]) * lng_to_m
+    py = (point[0] - line_start[0]) * lat_to_m
+    
+    # Calculate parameter t for projection
+    if d_start_end == 0:
+        return d_start_point
+        
+    t = max(0, min(1, (px * dx + py * dy) / (dx * dx + dy * dy)))
+    
+    # Calculate projection point
+    proj_lng = line_start[1] + t * (line_end[1] - line_start[1])
+    proj_lat = line_start[0] + t * (line_end[0] - line_start[0])
+    
+    # Return distance from point to projection
+    return distance_m(point, (proj_lat, proj_lng))
+
+
+def find_waypoints_near_path(path: List[List[float]], max_detour: int, waypoint_types: List[str]) -> List[Dict[str, Any]]:
+    """
+    Find waypoints within max_detour meters of the path.
+    
+    Args:
+        path: List of [lat, lng] coordinates defining the path
+        max_detour: Maximum distance in meters from the path
+        waypoint_types: List of waypoint types to include ('water', 'store')
+        
+    Returns:
+        List of nearby waypoints with distance information
+    """
+    waypoints = load_waypoints_data()
+    if not waypoints:
+        return []
+    
+    nearby_waypoints = []
+    
+    def waypoint_matches_types(waypoint: Dict[str, Any], requested: List[str]) -> bool:
+        if not requested:
+            return True
+        req = {str(x).lower() for x in requested}
+
+        # Expand umbrella categories into concrete OSM-like types
+        store_like = {
+            'convenience','supermarket','grocery','general','kiosk','marketplace','shop',
+            'beverages','variety_store','chemist','pharmacy'
+        }
+        food_like = {
+            'cafe','fast_food','restaurant','pub','bar','vending_machine','ice_cream'
+        }
+        water_like = {'drinking_water','water','water_point'}
+
+        allowed: set = set()
+        for r in req:
+            if r in ('store','shop','market'):
+                allowed |= store_like
+            elif r in ('food','drink','eat'):
+                allowed |= food_like
+            elif r in ('water','drinking_water'):
+                allowed |= water_like
+            else:
+                allowed.add(r)
+
+        # Candidate values to check (common fields)
+        typ = str(waypoint.get('type','')).lower()
+        amenity = str(waypoint.get('amenity','')).lower()
+        shop = str(waypoint.get('shop','')).lower()
+        tags = waypoint.get('tags') or {}
+        tag_amenity = str(tags.get('amenity','')).lower()
+        tag_shop = str(tags.get('shop','')).lower()
+        name = str(waypoint.get('name','')).lower()
+
+        candidates = {typ, amenity, shop, tag_amenity, tag_shop}
+        if any(c in allowed for c in candidates if c):
+            return True
+
+        # Heuristic: if requesting store-like and name suggests a store/market
+        store_keywords = ('store','shop','market','mart','7-eleven','7 eleven','bodega')
+        if (('store' in req or 'shop' in req or 'market' in req) and name):
+            if any(k in name for k in store_keywords):
+                return True
+
+        # Heuristic: if requesting water and name suggests water fountain/refill
+        if (('water' in req or 'drinking_water' in req) and name):
+            if any(k in name for k in ('water','fountain','refill')):
+                return True
+
+        return False
+
+    for waypoint in waypoints:
+        # Flexible filter by requested types/categories
+        if not waypoint_matches_types(waypoint, waypoint_types):
+            continue
+            
+        waypoint_coord = tuple(waypoint['coordinates'])  # [lat, lng]
+        min_distance = float('inf')
+        closest_segment_idx = -1
+        
+        # Check distance to each path segment
+        for i in range(len(path) - 1):
+            segment_start = tuple(path[i])      # [lat, lng]
+            segment_end = tuple(path[i + 1])    # [lat, lng]
+            
+            distance = point_to_line_distance(waypoint_coord, segment_start, segment_end)
+            
+            if distance < min_distance:
+                min_distance = distance
+                closest_segment_idx = i
+        
+        # Include waypoint if within detour distance
+        if min_distance <= max_detour:
+            waypoint_with_distance = waypoint.copy()
+            waypoint_with_distance['distance_to_path_m'] = round(min_distance, 1)
+            waypoint_with_distance['closest_segment'] = closest_segment_idx
+            nearby_waypoints.append(waypoint_with_distance)
+    
+    # Sort by distance to path
+    nearby_waypoints.sort(key=lambda w: w['distance_to_path_m'])
+    
+    return nearby_waypoints
+
+
+# Add this endpoint to app.py
+
+@app.post("/waypoints/near_path")
+async def waypoints_near_path(req: WaypointsNearPathRequest) -> Dict[str, Any]:
+    """Find waypoints near the given path within the specified detour distance."""
+    
+    if not req.path or len(req.path) < 2:
+        return {"error": "Path must contain at least 2 points"}
+    
+    try:
+        nearby_waypoints = find_waypoints_near_path(
+            req.path, 
+            req.max_detour_meters,
+            req.waypoint_types
+        )
+        
+        # Group by type for summary
+        type_counts = {}
+        for wp in nearby_waypoints:
+            wp_type = wp.get('type', 'unknown')
+            type_counts[wp_type] = type_counts.get(wp_type, 0) + 1
+        
+        return {
+            "waypoints": nearby_waypoints,
+            "total_found": len(nearby_waypoints),
+            "type_counts": type_counts,
+            "max_detour_meters": req.max_detour_meters,
+            "types_requested": req.waypoint_types,
+            "path_segments": len(req.path) - 1
+        }
+        
+    except Exception as e:
+        return {"error": f"Failed to find waypoints: {str(e)}"}
+
+
+@app.get("/waypoints/all")
+async def get_all_waypoints() -> Dict[str, Any]:
+    """Get all available waypoints."""
+    waypoints = load_waypoints_data()
+    
+    # Group by type for summary
+    type_counts = {}
+    for wp in waypoints:
+        wp_type = wp.get('type', 'unknown')
+        type_counts[wp_type] = type_counts.get(wp_type, 0) + 1
+    
+    return {
+        "waypoints": waypoints,
+        "total_count": len(waypoints),
+        "type_counts": type_counts
+    }
+
+
+@app.get("/waypoints/types")
+async def get_waypoint_types() -> Dict[str, Any]:
+    """Get available waypoint types and their counts."""
+    waypoints = load_waypoints_data()
+    
+    def derive_types(wp: Dict[str, Any]) -> List[str]:
+        # Gather raw indicators
+        typ = str(wp.get('type','')).lower()
+        amenity = str(wp.get('amenity','')).lower()
+        shop = str(wp.get('shop','')).lower()
+        tags = wp.get('tags') or {}
+        tag_amenity = str(tags.get('amenity','')).lower()
+        tag_shop = str(tags.get('shop','')).lower()
+        name = str(wp.get('name','')).lower()
+
+        raw = {x for x in (typ, amenity, shop, tag_amenity, tag_shop) if x}
+
+        # Category mappings
+        store_like = {
+            'convenience','supermarket','grocery','general','kiosk','marketplace','shop',
+            'beverages','variety_store','chemist','pharmacy'
+        }
+        food_like = {
+            'cafe','fast_food','restaurant','pub','bar','vending_machine','ice_cream'
+        }
+        water_like = {'drinking_water','water','water_point'}
+
+        derived = set()
+        if raw & store_like:
+            derived.add('store')
+        if raw & food_like:
+            derived.add('food')
+        if raw & water_like:
+            derived.add('water')
+
+        # Heuristics from name
+        if name:
+            if any(k in name for k in ('store','shop','market','mart','7-eleven','7 eleven','bodega')):
+                derived.add('store')
+            if any(k in name for k in ('cafe','coffee','burger','pizza','deli','grill','restaurant')):
+                derived.add('food')
+            if any(k in name for k in ('water','fountain','refill')):
+                derived.add('water')
+
+        # Expose raw values too
+        return list(derived | raw)
+
+    counts: Dict[str, int] = {}
+    for wp in waypoints:
+        for t in derive_types(wp):
+            counts[t] = counts.get(t, 0) + 1
+    
+    return {
+        "available_types": sorted(counts.keys()),
+        "type_counts": counts,
+        "total_waypoints": len(waypoints)
+    }
+
+
+# Add required imports at the top
+
+# Update the lifespan function to also load waypoints
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load the segmented graph and waypoints on startup."""
+    global G
+    # Load graph (existing code)
+    enhanced_graph_path = os.path.join(os.path.dirname(__file__), "data", "graph_segments_with_shade.gpickle")
+    original_graph_path = os.path.join(os.path.dirname(__file__), "data", "graph_segments.gpickle")
+    
+    try:
+        if os.path.exists(enhanced_graph_path):
+            with open(enhanced_graph_path, "rb") as f:
+                G = pickle.load(f)
+            print(f"Loaded enhanced graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+            sample_edge = next(iter(G.edges(data=True)), None)
+            if sample_edge and 'shade_fraction_9' in sample_edge[2]:
+                print("✅ Shade data available for enhanced pathfinding")
+            else:
+                print("⚠️ No shade data found in enhanced graph")
+        else:
+            with open(original_graph_path, "rb") as f:
+                G = pickle.load(f)
+            print(f"Loaded original graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+            print("⚠️ Enhanced graph not found - shade-aware pathfinding not available")
+    except Exception as e:
+        print(f"Failed to load graph: {e}")
+        G = None
+    
+    # Load waypoints
+    load_waypoints_data()
+    
     yield
 
-
-app = FastAPI(title="PennApps Demo Backend", lifespan=lifespan)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend domain
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+## Removed duplicate lifespan/app/CORS. Using startup event defined at top.
 
 
 def find_nearest_node(lat: float, lon: float) -> Optional[Tuple[float, float]]:
@@ -94,6 +517,7 @@ class ShortestPathRequest(BaseModel):
     start_lng: float
     end_lat: float
     end_lng: float
+    add_water_stop: Optional[bool] = False
 
 
 class ShadeAwarePathRequest(BaseModel):
@@ -103,6 +527,7 @@ class ShadeAwarePathRequest(BaseModel):
     end_lng: float
     time: Optional[int] = 9  # Hour 0-23, default 9am
     shade_penalty: Optional[float] = 1.0  # Penalty factor for shaded areas
+    add_water_stop: Optional[bool] = False
 
 
 @app.get("/health")
@@ -179,6 +604,70 @@ async def shortest_path(req: ShortestPathRequest) -> Dict[str, Any]:
         return {"error": "Could not find nearest nodes"}
     
     try:
+        # If user requested a water stop, try routing via a shop/water waypoint first
+        if getattr(req, 'add_water_stop', False):
+            helper = _get_find_path_with_water_stop()
+            if helper is None:
+                print("add_water_stop requested but helper not available; falling back to direct route")
+            else:
+                try:
+                    path_ls, waypoint_infos, full_path_nodes = helper(
+                        G,
+                        (req.start_lat, req.start_lng),
+                        (req.end_lat, req.end_lng)
+                    )
+                except Exception as e:
+                    print(f"find_path_with_water_stop failed: {e}")
+                    path_ls, waypoint_infos, full_path_nodes = None, None, None
+
+                if full_path_nodes:
+                    # Convert node ids to (lon,lat) then to [[lat,lng]]
+                    coords_lonlat = [(G.nodes[n]['x'], G.nodes[n]['y']) for n in full_path_nodes]
+                    path_coords = lonlat_to_latlng(coords_lonlat)
+
+                    # Compute total distance using original weights
+                    total_distance = 0.0
+                    shaded_segments = 0
+                    total_shade_length = 0.0
+                    total_path_length = 0.0
+                    sample_edge = next(iter(G.edges(data=True)), None)
+                    has_shade_data = sample_edge and 'shade_fraction_9' in sample_edge[2]
+                    for i in range(len(full_path_nodes) - 1):
+                        u, v = full_path_nodes[i], full_path_nodes[i + 1]
+                        if G.has_edge(u, v):
+                            edge_data = G[u][v]
+                            w = edge_data.get('weight', edge_data.get('length', 0))
+                            total_distance += w
+                            if has_shade_data:
+                                total_path_length += edge_data.get('weight', 0)
+                                total_shade_length += edge_data.get('shade_length_9', 0)
+                                if edge_data.get('is_shaded_9', False):
+                                    shaded_segments += 1
+
+                    result = {
+                        "path": path_coords,
+                        "start_node": [start_node[1], start_node[0]],  # [lat, lng]
+                        "end_node": [end_node[1], end_node[0]],        # [lat, lng]
+                        "total_distance_m": total_distance,
+                        "num_segments": len(full_path_nodes) - 1,
+                        "shade_mode": "standard",
+                        "analysis_time": "9:00",
+                        "routed_via_water_stop": True,
+                        "waypoints": waypoint_infos or [],
+                    }
+                    if has_shade_data and total_path_length > 0:
+                        shade_percentage = (total_shade_length / total_path_length * 100)
+                        result.update({
+                            "shaded_segments": shaded_segments,
+                            "shade_percentage": round(shade_percentage, 1),
+                            "total_shade_length_m": round(total_shade_length, 1),
+                            "original_distance_m": total_distance,
+                            "shade_aware_distance_m": total_distance,
+                            "shade_penalty_applied": 1.0,
+                            "shade_penalty_added_m": 0.0,
+                        })
+                    return result
+
         # Compute shortest path using NetworkX
         path_nodes = nx.shortest_path(G, start_node, end_node, weight='weight')
         
@@ -317,8 +806,38 @@ async def shortest_path_shade_aware(req: ShadeAwarePathRequest) -> Dict[str, Any
             new_weight = calculate_shade_aware_weight(edge_attrs, req.shade_penalty, is_daylight, req.time)
             edge_attrs['shade_aware_weight'] = new_weight
         
-        # Compute shortest path using shade-aware weights
-        path_nodes = nx.shortest_path(temp_graph, start_node, end_node, weight='shade_aware_weight')
+        # If user requested a water stop, try to find a waypoint and force path via it
+        used_water_stop = False
+        used_waypoints = []
+        helper = _get_find_path_with_water_stop()
+        if getattr(req, 'add_water_stop', False) and helper is not None:
+            shop_wp = None
+            try:
+                _ls, waypoint_infos, _nodes = helper(
+                    G, (req.start_lat, req.start_lng), (req.end_lat, req.end_lng)
+                )
+                if waypoint_infos:
+                    used_waypoints = waypoint_infos
+                    shop_wp = waypoint_infos[0]
+            except Exception as e:
+                print(f"find_path_with_water_stop failed (shade): {e}")
+                shop_wp = None
+
+            if shop_wp is not None:
+                shop_node = find_nearest_node(shop_wp["lat"], shop_wp["lon"]) if isinstance(shop_wp, dict) else None
+                if shop_node is not None:
+                    p1 = nx.shortest_path(temp_graph, start_node, shop_node, weight='shade_aware_weight')
+                    p2 = nx.shortest_path(temp_graph, shop_node, end_node, weight='shade_aware_weight')
+                    # Combine, avoiding duplicate of the junction node
+                    path_nodes = p1[:-1] + p2
+                    used_water_stop = True
+                else:
+                    path_nodes = nx.shortest_path(temp_graph, start_node, end_node, weight='shade_aware_weight')
+            else:
+                path_nodes = nx.shortest_path(temp_graph, start_node, end_node, weight='shade_aware_weight')
+        else:
+            # Compute shortest path using shade-aware weights
+            path_nodes = nx.shortest_path(temp_graph, start_node, end_node, weight='shade_aware_weight')
         
         # Convert path to coordinate list for frontend
         path_coords = lonlat_to_latlng(path_nodes)
@@ -366,7 +885,9 @@ async def shortest_path_shade_aware(req: ShadeAwarePathRequest) -> Dict[str, Any
             "shaded_segments": shaded_segments,
             "shade_percentage": round(shade_percentage, 1),
             "total_shade_length_m": round(total_shade_length, 1),
-            "shade_penalty_added_m": round(shade_aware_distance - original_distance, 1)
+            "shade_penalty_added_m": round(shade_aware_distance - original_distance, 1),
+            "routed_via_water_stop": used_water_stop,
+            "waypoints": used_waypoints,
         }
         
     except nx.NetworkXNoPath:

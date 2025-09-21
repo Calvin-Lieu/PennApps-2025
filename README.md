@@ -159,6 +159,11 @@ Shadow analysis pipeline in action, processing individual street segments (edges
 
 Temporal shadow analysis across different hours of the day, demonstrating how shade patterns shift as the sun moves. Each visualization captures shadow distribution at key times (morning, midday, afternoon, evening), showing the dynamic nature of urban shade coverage that drives our intelligent routing decisions.
 
+### Comprehensive Shade Analysis
+![Street-level shade profiling across temporal periods](figs/street_profiling.png)
+
+Aggregated shade coverage analysis that combines temporal shadow data across all time periods to create comprehensive shade profiles for each street segment. This visualization represents the culmination of our shadow analysis pipeline, showing average shade coverage that enables optimal route planning throughout the day.
+
 ## Future Work
 
 ### Core Enhancements

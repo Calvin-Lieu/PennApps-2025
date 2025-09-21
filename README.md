@@ -1,5 +1,7 @@
 # PennApps 2025: ShadeNav
 
+![ShadeNav Demo](figs/hackathon7.png)
+
 Climate change has created a devastating feedback loop: rising temperatures make walking unbearable, forcing people to drive more, pumping more greenhouse gases into the atmosphere, making cities even hotter.
 
 **ShadeNav breaks this cycle** by making walking comfortable again through intelligent shade-optimized routing. Using satellite analysis and real-time sun positioning, we find paths that maximize shade coverage - because shaded areas feel up to 20°F cooler than direct sunlight.
@@ -7,7 +9,6 @@ Climate change has created a devastating feedback loop: rising temperatures make
 A comprehensive route-planning system for downtown Philadelphia that optimizes paths based on shade coverage and essential services using advanced satellite imagery analysis and OpenStreetMap data.
 
 See: https://devpost.com/software/shadenav
-
 
 ## Project Structure
 
@@ -43,10 +44,16 @@ See: https://devpost.com/software/shadenav
 - **Essential Services**: Water fountains, convenience stores, and climate-controlled spaces
 - **Adaptive Selection**: Dynamic waypoint adjustment based on route length and weather conditions
 
+### Weather and UV Integration 
+- **Hourly Weather & UV Updates:** Real-time weather and UV index integrated directly into routing, refreshing every hour.
+- **Heat-Aware Routing:** Helps pedestrians track heat stress conditions, avoid unsafe UV exposure, and choose cooler, safer walking paths.
+
 ### Terrain Heuristic for Pathfinding
 - **Grade-Aware Costing**: Incorporates slope from DEM tiles to penalize steep segments.
 - **Surface & Roughness Scoring**: Weights edges by OSM surface (e.g. cobblestone, unpaved) when respective toggles are checked
 - **Accessibility Constraints**: Applies hard costs to stairs/steps and soft penalties for camber/irregularity, enabling wheelchair-friendly routing and safer sidewalk selection
+
+
 
 ## Quickstart
 
@@ -164,6 +171,11 @@ Shadow analysis pipeline in action, processing individual street segments (edges
 
 Temporal shadow analysis across different hours of the day, demonstrating how shade patterns shift as the sun moves. Each visualization captures shadow distribution at key times (morning, midday, afternoon, evening), showing the dynamic nature of urban shade coverage that drives our intelligent routing decisions.
 
+### Comprehensive Shade Analysis
+![Street-level shade profiling across temporal periods](figs/street_profiling.png)
+
+Aggregated shade coverage analysis that combines temporal shadow data across all time periods to create comprehensive shade profiles for each street segment. This visualization represents the culmination of our shadow analysis pipeline, showing average shade coverage that enables optimal route planning throughout the day.
+
 ## Future Work
 
 ### Core Enhancements
@@ -195,3 +207,7 @@ Temporal shadow analysis across different hours of the day, demonstrating how sh
 - `earthengine-api`: Google Earth Engine integration for satellite data
 - `python-dotenv`: Environment variable management
 - `scipy`: Advanced interpolation for satellite data processing
+
+### External Services
+- **Open-Meteo**: Provides real-time weather and UV index data for routing decisions. [Attribution](https://open-meteo.com/)
+

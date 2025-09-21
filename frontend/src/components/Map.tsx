@@ -256,6 +256,7 @@ export default function Map({
   const [showTreeShadows, setShowTreeShadows] = useState(false); // Toggle for tree shadows
   const showTreeShadowsRef = useRef(false); // Ref to track current state
   const fetchTokenRef = useRef(0);
+  const handleMapClickRef = useRef<(e: L.LeafletMouseEvent) => void>(() => { });
   const retryAttemptRef = useRef<string | null>(null); // Track current path being retried
   const weatherDebounceRef = useRef<number | null>(null);
   const weatherHourRef = useRef<number>(currentHour);
@@ -1138,6 +1139,10 @@ export default function Map({
     }
   }, [useShadeRouting]);
 
+  useEffect(() => {
+    handleMapClickRef.current = handleMapClick;
+  }, [handleMapClick]);
+
   // attach click handler after map created
   useEffect(() => {
     console.log("TestMap useEffect triggered - Map setup");
@@ -1176,7 +1181,9 @@ export default function Map({
     }
 
     // Add click handler for placing markers (now supports pathfinding)
-    map.on('click', handleMapClick);
+    // map.on('click', handleMapClick);
+    const onClick = (e: L.LeafletMouseEvent) => handleMapClickRef.current(e);
+    map.on('click', onClick);
 
     // Initial and debounced weather fetch on map move
     const scheduleWeatherFetch = () => {
@@ -1205,11 +1212,11 @@ export default function Map({
     return () => {
       console.log("TestMap cleanup - removing map");
 
-      
-  map.off('click', handleMapClick);
-  map.off('moveend', scheduleWeatherFetch);
-      
+      // map.off('click', handleMapClick);
+      map.off('click', onClick);
 
+      map.off('moveend', scheduleWeatherFetch);
+      
       // Clear layers
       if (edgeLayerRef.current) {
         try {
@@ -1261,7 +1268,7 @@ export default function Map({
       // Remove map
       map.remove();
     };
-  }, [handleMapClick]); // Include handleMapClick in dependencies
+  }, []); // Include handleMapClick in dependencies
 
   // Keep hour ref in sync and refetch weather when the hour changes
   useEffect(() => {

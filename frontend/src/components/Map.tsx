@@ -91,6 +91,20 @@ export default function Map({
   const [useShadeRouting, setUseShadeRouting] = useState(true); // Toggle for shade-aware routing
   const fetchTokenRef = useRef(0);
   const retryAttemptRef = useRef<string | null>(null); // Track current path being retried
+  const weatherDebounceRef = useRef<number | null>(null);
+  const weatherHourRef = useRef<number>(currentHour);
+
+  // Weather state
+  const [weather, setWeather] = useState<{
+    tempF: number | null;
+    tempC: number | null;
+    uv: number | null;
+    description?: string;
+    source?: string;
+    error?: string | null;
+    loading: boolean;
+  }>({ tempF: null, tempC: null, uv: null, description: undefined, source: undefined, error: null, loading: false });
+  const WEATHER_API_KEY: string | undefined = (import.meta as any).env.VITE_WEATHER_API_KEY;
 
   // Use refs instead of state to avoid re-renders for pathfinding
   const pathStateRef = useRef<PathState>({
@@ -438,6 +452,107 @@ export default function Map({
     }
   }, [ready, displaySimplePath]);
 
+  // Fetch weather (Weatherbit current conditions: temp + UV)
+  const fetchWeather = useCallback(async (lat: number, lon: number, hour: number) => {
+    // Helper: Open-Meteo fallback
+    const fetchFromOpenMeteo = async () => {
+      try {
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,uv_index&temperature_unit=fahrenheit&timezone=auto&past_days=1&forecast_days=2`;
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`Open-Meteo ${resp.status}`);
+        const data = await resp.json();
+        const times: string[] = data?.hourly?.time || [];
+        const temps: number[] = data?.hourly?.temperature_2m || [];
+        const uvs: number[] = data?.hourly?.uv_index || [];
+        // Robust match: choose index with minimum time diff to today's selected hour
+        const target = new Date();
+        target.setHours(hour, 0, 0, 0);
+        const targetDay = target.getFullYear() + '-' + String(target.getMonth() + 1).padStart(2, '0') + '-' + String(target.getDate()).padStart(2, '0');
+        let idx = -1;
+        let bestDiffSameDay = Infinity;
+        let bestAnyIdx = -1;
+        let bestAnyDiff = Infinity;
+        for (let i = 0; i < times.length; i++) {
+          const tStr = times[i];
+          const d = new Date(tStr);
+          const diff = Math.abs(d.getTime() - target.getTime());
+          if (diff < bestAnyDiff) { bestAnyDiff = diff; bestAnyIdx = i; }
+          const dDay = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+          if (dDay === targetDay && diff < bestDiffSameDay) { bestDiffSameDay = diff; idx = i; }
+        }
+        if (idx === -1) idx = bestAnyIdx;
+
+        const tempF: number | null = (idx >= 0 && typeof temps[idx] === 'number') ? temps[idx] : null;
+        const tempC: number | null = (typeof tempF === 'number') ? Math.round(((tempF - 32) * 5) / 9) : null;
+        let uv: number | null = (idx >= 0 && typeof uvs[idx] === 'number') ? uvs[idx] : null;
+        if (uv == null) uv = 0; // UV often missing at night – display 0 instead of blank
+        setWeather({ tempF, tempC, uv, description: undefined, source: 'Open‑Meteo', error: null, loading: false });
+      } catch (e: any) {
+        setWeather(w => ({ ...w, error: e?.message || 'Failed to fetch weather', loading: false }));
+      }
+    };
+
+    try {
+      setWeather(w => ({ ...w, loading: true, error: null }));
+      if (!WEATHER_API_KEY) {
+        // No key → go straight to Open-Meteo
+        await fetchFromOpenMeteo();
+        return;
+      }
+
+      // Try Weatherbit first
+      const url = `https://api.weatherbit.io/v2.0/forecast/hourly?lat=${lat}&lon=${lon}&hours=48&key=${WEATHER_API_KEY}&units=I`;
+      const resp = await fetch(url);
+      if (resp.status === 401 || resp.status === 403) {
+        // Key invalid / not allowed from browser → fallback
+        await fetchFromOpenMeteo();
+        return;
+      }
+      if (!resp.ok) throw new Error(`Weatherbit ${resp.status}`);
+      const data = await resp.json();
+      const arr: any[] = data?.data || [];
+
+      // Build today's date string in user local
+      const now = new Date();
+      const yyyy = now.getFullYear();
+      const mm = String(now.getMonth() + 1).padStart(2, '0');
+      const dd = String(now.getDate()).padStart(2, '0');
+      const todayStr = `${yyyy}-${mm}-${dd}`;
+
+      let chosen: any | null = null;
+      for (const item of arr) {
+        const tsLocal: string | undefined = item?.timestamp_local;
+        if (!tsLocal) continue;
+        const dPart = tsLocal.slice(0, 10);
+        const hPart = parseInt(tsLocal.slice(11, 13), 10);
+        if (dPart === todayStr && hPart === hour) { chosen = item; break; }
+      }
+      // Fallback: nearest hour today
+      if (!chosen) {
+        let best: { diff: number; item: any | null } = { diff: Infinity, item: null };
+        for (const item of arr) {
+          const tsLocal: string | undefined = item?.timestamp_local;
+          if (!tsLocal) continue;
+          const dPart = tsLocal.slice(0, 10);
+          const hPart = parseInt(tsLocal.slice(11, 13), 10);
+          if (dPart !== todayStr) continue;
+          const diff = Math.abs(hPart - hour);
+          if (diff < best.diff) best = { diff, item };
+        }
+        chosen = best.item;
+      }
+
+      const tempF: number | null = (typeof chosen?.temp === 'number') ? chosen.temp : null;
+      const tempC: number | null = (typeof tempF === 'number') ? Math.round(((tempF - 32) * 5) / 9) : null;
+      const uv: number | null = (typeof chosen?.uv === 'number') ? chosen.uv : null;
+      const description: string | undefined = chosen?.weather?.description || undefined;
+      setWeather({ tempF, tempC, uv, description, source: 'Weatherbit (hourly)', error: null, loading: false });
+    } catch (e: any) {
+      // Network or parse error → attempt fallback
+      await fetchFromOpenMeteo();
+    }
+  }, [WEATHER_API_KEY]);
+
   // Unified function to compute and display path with backend API calls
   const computeAndDisplayPath = useCallback(async () => {
     if (!pathStateRef.current.startPoint || !pathStateRef.current.endPoint) {
@@ -644,6 +759,19 @@ export default function Map({
     // Add click handler for placing markers (now supports pathfinding)
     map.on('click', handleMapClick);
 
+    // Initial and debounced weather fetch on map move
+    const scheduleWeatherFetch = () => {
+      const center = map.getCenter();
+      if (weatherDebounceRef.current) window.clearTimeout(weatherDebounceRef.current);
+      weatherDebounceRef.current = window.setTimeout(() => {
+        const h = weatherHourRef.current;
+        fetchWeather(center.lat, center.lng, h);
+      }, 400);
+    };
+  map.on('moveend', scheduleWeatherFetch);
+    // Fetch immediately on mount
+    scheduleWeatherFetch();
+
     // Create shade layer
     map.whenReady(() => {
       setTimeout(() => {
@@ -656,7 +784,8 @@ export default function Map({
     return () => {
       console.log("TestMap cleanup - removing map");
       
-      map.off('click', handleMapClick);
+  map.off('click', handleMapClick);
+  map.off('moveend', scheduleWeatherFetch);
       
       // Clear layers
       if (edgeLayerRef.current) {
@@ -703,6 +832,16 @@ export default function Map({
       map.remove();
     };
   }, [handleMapClick]); // Include handleMapClick in dependencies
+
+  // Keep hour ref in sync and refetch weather when the hour changes
+  useEffect(() => {
+    weatherHourRef.current = currentHour;
+    const center = mapRef.current?.getCenter();
+    if (center) {
+      // Immediate refresh on hour change
+      fetchWeather(center.lat, center.lng, currentHour);
+    }
+  }, [currentHour, fetchWeather]);
 
   // Update shade time when hour changes
   useEffect(() => {
@@ -992,6 +1131,40 @@ export default function Map({
                 <div>Segments: {pathUIState.path.length - 1}</div>
               )}
             </div>
+          </div>
+        )}
+      </div>
+
+      {/* Weather Box - Bottom Right (above legend) */}
+      <div style={{
+        position: 'absolute',
+        bottom: 120,
+        right: 20,
+        background: 'rgba(255,255,255,0.92)',
+        padding: '12px',
+        borderRadius: '8px',
+        boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+        zIndex: 1000,
+        font: "12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+        minWidth: 200,
+      }}>
+        <div style={{ fontWeight: 'bold', marginBottom: 6, textAlign: 'center' }}>
+          Local Weather
+        </div>
+        {weather.loading ? (
+          <div style={{ textAlign: 'center', color: '#007cba' }}>⏳ Loading…</div>
+        ) : weather.error ? (
+          <div style={{ textAlign: 'center', color: 'red' }}>⚠️ {weather.error}</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center' }}>
+            <div>Temperature: {weather.tempF != null ? `${Math.round(weather.tempF)}°F` : '—'}</div>
+            <div>UV Index: {weather.uv != null ? `${Math.round(weather.uv)}` : '—'}</div>
+            {weather.description && (
+              <div style={{ fontSize: 11, color: '#666' }}>{weather.description}</div>
+            )}
+            {weather.source && (
+              <div style={{ fontSize: 10, color: '#999' }}>Source: {weather.source}</div>
+            )}
           </div>
         )}
       </div>

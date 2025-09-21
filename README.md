@@ -176,6 +176,15 @@ Temporal shadow analysis across different hours of the day, demonstrating how sh
 
 Aggregated shade coverage analysis that combines temporal shadow data across all time periods to create comprehensive shade profiles for each street segment. This visualization represents the culmination of our shadow analysis pipeline, showing average shade coverage that enables optimal route planning throughout the day.
 
+## Development Highlights
+
+### These are completed components that demonstrate core capabilities but are not yet fully integrated into the main ShadeNav system:
+
+- **Tree Detection System**: High-resolution NDVI/NDWI analysis with 5m grid scoring, successfully identifying 700+ urban trees.  
+
+![Prototype demo image with water stops shown with water droplet, leaflet POI tags include `drinking_water`, `cafe`, `vending_machine`.](figs/hackathon8)
+- **Water Stop Waypoint Routing**: Dynamic re-routing through convenience stores and water fountains using POI snapping and path-projection heuristics.  
+
 ## Future Work
 
 ### Core Enhancements

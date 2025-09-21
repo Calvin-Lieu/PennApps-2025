@@ -286,7 +286,7 @@ export default function Map({
       date: when,
       color: "#01112f",
       opacity: 0.7,
-      apiKey: (import.meta as any).env.VITE_SHADEMAP_KEY,
+      apiKey: import.meta.env.VITE_SHADEMAP_KEY || 'your-shademap-api-key',
       terrainSource: {
         tileSize: 256,
         maxZoom: 15,
@@ -458,7 +458,12 @@ export default function Map({
 
     try {
       console.log("🌳 Loading tree shadows from backend...");
-      const response = await fetch('http://localhost:8000/tree_shadows');
+      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}/tree_shadows`);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
       const data = await response.json();
 
       if (data.error) {
@@ -773,7 +778,7 @@ export default function Map({
       } : basePayload;
 
       console.log("📡 Calling backend API:", endpoint, payload);
-      const response = await fetch(`http://localhost:8000/${endpoint}`, {
+      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}/${endpoint}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

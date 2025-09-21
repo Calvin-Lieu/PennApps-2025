@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NetworkX + Tree Shadow Interaction Test</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { margin: 0; padding: 20px; font-family: Arial, sans-serif; }
+        #map { height: 600px; width: 100%; border: 2px solid #ccc; }
+        .controls { margin: 20px 0; }
+        .controls button { margin: 5px; padding: 10px 15px; font-size: 14px; }
+        .debug-info { 
+            background: #f5f5f5; 
+            padding: 15px; 
+            margin: 10px 0; 
+            border-radius: 5px; 
+            font-family: monospace; 
+            white-space: pre-wrap; 
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .test-result { 
+            padding: 10px; 
+            margin: 5px 0; 
+            border-radius: 3px; 
+        }
+        .success { background: #d4edda; color: #155724; }
+        .error { background: #f8d7da; color: #721c24; }
+        .info { background: #d1ecf1; color: #0c5460; }
+        .warning { background: #fff3cd; color: #856404; }
+        .comparison { 
+            display: grid; 
+            grid-template-columns: 1fr 1fr; 
+            gap: 20px; 
+            margin: 20px 0; 
+        }
+        .section { 
+            border: 1px solid #ddd; 
+            padding: 15px; 
+            border-radius: 5px; 
+        }
+    </style>
+</head>
+<body>
+    <h1>🔗 NetworkX + Tree Shadow Interaction Test</h1>
+    <p>This test will help us understand how NetworkX pathfinding interacts with tree shadow positions.</p>
+    
+    <div class="controls">
+        <button onclick="loadTreeData()">1. Load Tree Data</button>
+        <button onclick="testNetworkXPathfinding()">2. Test NetworkX Pathfinding</button>
+        <button onclick="analyzePathTreeOverlap()">3. Analyze Path-Tree Overlap</button>
+        <button onclick="testSpecificTreeLocations()">4. Test Specific Tree Locations</button>
+        <button onclick="clearResults()">Clear Results</button>
+    </div>
+    
+    <div class="comparison">
+        <div class="section">
+            <h3>🌳 Tree Data Analysis</h3>
+            <div id="treeAnalysis"></div>
+        </div>
+        <div class="section">
+            <h3>🛣️ NetworkX Path Analysis</h3>
+            <div id="pathAnalysis"></div>
+        </div>
+    </div>
+    
+    <div id="map"></div>
+    
+    <div id="results"></div>
+    
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Global variables
+        let map;
+        let treeShadowLayer;
+        let pathLayer;
+        let treeData = [];
+        let pathData = [];
+        let testMarkers = [];
+        
+        // Initialize map
+        function initMap() {
+            map = L.map('map').setView([39.955025, -75.160625], 16);
+            
+            L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; OSM'
+            }).addTo(map);
+            
+            treeShadowLayer = L.layerGroup().addTo(map);
+            pathLayer = L.layerGroup().addTo(map);
+            
+            log('✅ Map initialized', 'success');
+        }
+        
+        // Logging function
+        function log(message, type = 'info') {
+            const results = document.getElementById('results');
+            const div = document.createElement('div');
+            div.className = `test-result ${type}`;
+            div.textContent = `${new Date().toLocaleTimeString()}: ${message}`;
+            results.appendChild(div);
+            console.log(message);
+        }
+        
+        // Load tree data from backend
+        async function loadTreeData() {
+            try {
+                log('🌳 Loading tree data from backend...', 'info');
+                
+                const response = await fetch('http://localhost:8000/tree_shadows');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const data = await response.json();
+                
+                if (!data.features || !Array.isArray(data.features)) {
+                    throw new Error('No features found in response');
+                }
+                
+                // Clear existing tree shadows
+                treeShadowLayer.clearLayers();
+                treeData = [];
+                
+                // Process tree data
+                let treesLoaded = 0;
+                data.features.forEach((feature, index) => {
+                    try {
+                        const { geometry, properties } = feature;
+                        
+                        if (geometry.type === 'Polygon' && geometry.coordinates && geometry.coordinates[0]) {
+                            // Convert GeoJSON coordinates [lng, lat] to Leaflet format [lat, lng]
+                            const leafletCoords = geometry.coordinates[0].map(coord => [coord[1], coord[0]]);
+                            
+                            // Store tree data for analysis
+                            treeData.push({
+                                id: properties.tree_id || index,
+                                lat: properties.center_lat || leafletCoords[0][0],
+                                lng: properties.center_lng || leafletCoords[0][1],
+                                density: properties.density || 0,
+                                radius: properties.radius_m || 0,
+                                polygon: leafletCoords
+                            });
+                            
+                            // Create polygon with shadow styling
+                            const polygon = L.polygon(leafletCoords, {
+                                fillColor: '#01112f',
+                                color: '#01112f',
+                                fillOpacity: 0.3,
+                                opacity: 0.7,
+                                weight: 1,
+                                className: 'tree-shadow-polygon'
+                            });
+                            
+                            // Add tooltip
+                            polygon.bindTooltip(`Tree ${properties.tree_id || index}: Density ${(properties.density || 0).toFixed(2)}`);
+                            
+                            polygon.addTo(treeShadowLayer);
+                            treesLoaded++;
+                        }
+                    } catch (error) {
+                        console.warn(`Error rendering tree shadow ${index}:`, error);
+                    }
+                });
+                
+                log(`✅ Loaded ${treesLoaded} tree shadows`, 'success');
+                
+                // Analyze tree distribution
+                analyzeTreeDistribution();
+                
+            } catch (error) {
+                log(`❌ Failed to load tree data: ${error.message}`, 'error');
+            }
+        }
+        
+        // Analyze tree distribution
+        function analyzeTreeDistribution() {
+            if (treeData.length === 0) return;
+            
+            const lats = treeData.map(t => t.lat);
+            const lngs = treeData.map(t => t.lng);
+            
+            const analysis = {
+                count: treeData.length,
+                latRange: { min: Math.min(...lats), max: Math.max(...lats) },
+                lngRange: { min: Math.min(...lngs), max: Math.max(...lngs) },
+                center: {
+                    lat: (Math.min(...lats) + Math.max(...lats)) / 2,
+                    lng: (Math.min(...lngs) + Math.max(...lngs)) / 2
+                },
+                densityStats: {
+                    min: Math.min(...treeData.map(t => t.density)),
+                    max: Math.max(...treeData.map(t => t.density)),
+                    avg: treeData.reduce((sum, t) => sum + t.density, 0) / treeData.length
+                }
+            };
+            
+            document.getElementById('treeAnalysis').innerHTML = `
+                <strong>Tree Distribution:</strong><br>
+                • Count: ${analysis.count} trees<br>
+                • Latitude: ${analysis.latRange.min.toFixed(6)} to ${analysis.latRange.max.toFixed(6)}<br>
+                • Longitude: ${analysis.lngRange.min.toFixed(6)} to ${analysis.lngRange.max.toFixed(6)}<br>
+                • Center: [${analysis.center.lat.toFixed(6)}, ${analysis.center.lng.toFixed(6)}]<br>
+                • Density: ${analysis.densityStats.min.toFixed(2)} to ${analysis.densityStats.max.toFixed(2)} (avg: ${analysis.densityStats.avg.toFixed(2)})<br>
+                <br>
+                <strong>Sample Trees:</strong><br>
+                ${treeData.slice(0, 5).map(t => `• Tree ${t.id}: [${t.lat.toFixed(6)}, ${t.lng.toFixed(6)}] (density: ${t.density.toFixed(2)})`).join('<br>')}
+            `;
+            
+            log(`📊 Tree analysis: ${analysis.count} trees in area [${analysis.latRange.min.toFixed(6)}, ${analysis.lngRange.min.toFixed(6)}] to [${analysis.latRange.max.toFixed(6)}, ${analysis.lngRange.max.toFixed(6)}]`, 'info');
+        }
+        
+        // Test NetworkX pathfinding
+        async function testNetworkXPathfinding() {
+            if (treeData.length === 0) {
+                log('❌ Load tree data first', 'error');
+                return;
+            }
+            
+            try {
+                log('🛣️ Testing NetworkX pathfinding...', 'info');
+                
+                // Test multiple paths through tree-dense areas
+                const testPaths = [
+                    {
+                        name: "Path 1: Through tree center",
+                        start: [treeData[0].lat, treeData[0].lng],
+                        end: [treeData[Math.floor(treeData.length/2)].lat, treeData[Math.floor(treeData.length/2)].lng]
+                    },
+                    {
+                        name: "Path 2: Tree edge to edge", 
+                        start: [39.94005, -75.16935], // Tree ID 5 area
+                        end: [39.949, -75.171] // Tree ID 0 area
+                    },
+                    {
+                        name: "Path 3: Short path in dense area",
+                        start: [39.94725, -75.15320], // Tree 228 area
+                        end: [39.94775, -75.15320] // Tree 240 area
+                    }
+                ];
+                
+                pathData = [];
+                
+                for (const testPath of testPaths) {
+                    log(`🔍 Testing ${testPath.name}...`, 'info');
+                    
+                    const response = await fetch('http://localhost:8000/shortest_path_shade', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            start_lat: testPath.start[0],
+                            start_lng: testPath.start[1],
+                            end_lat: testPath.end[0],
+                            end_lng: testPath.end[1],
+                            time: 9,
+                            shade_penalty: 1.0
+                        })
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.error) {
+                        log(`❌ ${testPath.name} failed: ${data.error}`, 'error');
+                        continue;
+                    }
+                    
+                    const pathCoords = data.path || [];
+                    pathData.push({
+                        name: testPath.name,
+                        coords: pathCoords,
+                        distance: data.original_distance_m || 0,
+                        shadeDistance: data.shade_aware_distance_m || 0
+                    });
+                    
+                    log(`✅ ${testPath.name}: ${pathCoords.length} points, ${(data.original_distance_m || 0).toFixed(1)}m`, 'success');
+                }
+                
+                // Visualize paths
+                visualizePaths();
+                analyzePathDistribution();
+                
+            } catch (error) {
+                log(`❌ NetworkX pathfinding failed: ${error.message}`, 'error');
+            }
+        }
+        
+        // Visualize paths on map
+        function visualizePaths() {
+            pathLayer.clearLayers();
+            testMarkers.forEach(marker => map.removeLayer(marker));
+            testMarkers = [];
+            
+            const colors = ['#ff0000', '#00ff00', '#0000ff', '#ffff00', '#ff00ff'];
+            
+            pathData.forEach((path, index) => {
+                const color = colors[index % colors.length];
+                
+                // Draw path line
+                const pathLine = L.polyline(path.coords, {
+                    color: color,
+                    weight: 4,
+                    opacity: 0.8
+                }).addTo(pathLayer);
+                
+                // Add start/end markers
+                const startMarker = L.circleMarker(path.coords[0], {
+                    radius: 8,
+                    fillColor: color,
+                    color: '#000',
+                    weight: 2,
+                    opacity: 1,
+                    fillOpacity: 0.8
+                }).addTo(map);
+                
+                const endMarker = L.circleMarker(path.coords[path.coords.length - 1], {
+                    radius: 8,
+                    fillColor: color,
+                    color: '#000',
+                    weight: 2,
+                    opacity: 1,
+                    fillOpacity: 0.8
+                }).addTo(map);
+                
+                startMarker.bindTooltip(`${path.name} - Start`);
+                endMarker.bindTooltip(`${path.name} - End`);
+                
+                testMarkers.push(startMarker, endMarker);
+            });
+        }
+        
+        // Analyze path distribution
+        function analyzePathDistribution() {
+            if (pathData.length === 0) return;
+            
+            let allCoords = [];
+            pathData.forEach(path => {
+                allCoords = allCoords.concat(path.coords);
+            });
+            
+            const lats = allCoords.map(c => c[0]);
+            const lngs = allCoords.map(c => c[1]);
+            
+            const analysis = {
+                pathCount: pathData.length,
+                totalPoints: allCoords.length,
+                latRange: { min: Math.min(...lats), max: Math.max(...lats) },
+                lngRange: { min: Math.min(...lngs), max: Math.max(...lngs) },
+                center: {
+                    lat: (Math.min(...lats) + Math.max(...lats)) / 2,
+                    lng: (Math.min(...lngs) + Math.max(...lngs)) / 2
+                }
+            };
+            
+            document.getElementById('pathAnalysis').innerHTML = `
+                <strong>Path Distribution:</strong><br>
+                • Paths: ${analysis.pathCount}<br>
+                • Total Points: ${analysis.totalPoints}<br>
+                • Latitude: ${analysis.latRange.min.toFixed(6)} to ${analysis.latRange.max.toFixed(6)}<br>
+                • Longitude: ${analysis.lngRange.min.toFixed(6)} to ${analysis.lngRange.max.toFixed(6)}<br>
+                • Center: [${analysis.center.lat.toFixed(6)}, ${analysis.center.lng.toFixed(6)}]<br>
+                <br>
+                <strong>Path Details:</strong><br>
+                ${pathData.map((p, i) => `• ${p.name}: ${p.coords.length} points, ${p.distance.toFixed(1)}m`).join('<br>')}
+            `;
+            
+            log(`📊 Path analysis: ${analysis.pathCount} paths with ${analysis.totalPoints} total points`, 'info');
+        }
+        
+        // Analyze path-tree overlap
+        function analyzePathTreeOverlap() {
+            if (treeData.length === 0 || pathData.length === 0) {
+                log('❌ Load both tree data and path data first', 'error');
+                return;
+            }
+            
+            log('🔍 Analyzing path-tree overlap...', 'info');
+            
+            let totalOverlaps = 0;
+            let totalPathPoints = 0;
+            
+            pathData.forEach((path, pathIndex) => {
+                let pathOverlaps = 0;
+                
+                path.coords.forEach((coord, coordIndex) => {
+                    totalPathPoints++;
+                    
+                    // Check if this point is near any tree
+                    const nearTrees = treeData.filter(tree => {
+                        const distance = Math.sqrt(
+                            Math.pow(coord[0] - tree.lat, 2) + 
+                            Math.pow(coord[1] - tree.lng, 2)
+                        );
+                        return distance < 0.001; // ~100m threshold
+                    });
+                    
+                    if (nearTrees.length > 0) {
+                        pathOverlaps++;
+                        totalOverlaps++;
+                        
+                        if (Math.random() < 0.1) { // Log 10% of overlaps
+                            log(`🎯 Path ${pathIndex+1} point ${coordIndex}: [${coord[0].toFixed(6)}, ${coord[1].toFixed(6)}] near trees: ${nearTrees.map(t => t.id).join(', ')}`, 'success');
+                        }
+                    }
+                });
+                
+                const overlapPct = path.coords.length > 0 ? (pathOverlaps / path.coords.length) * 100 : 0;
+                log(`📊 Path ${pathIndex+1} (${path.name}): ${pathOverlaps}/${path.coords.length} points near trees (${overlapPct.toFixed(1)}%)`, overlapPct > 0 ? 'success' : 'warning');
+            });
+            
+            const overallOverlapPct = totalPathPoints > 0 ? (totalOverlaps / totalPathPoints) * 100 : 0;
+            log(`🎯 OVERALL: ${totalOverlaps}/${totalPathPoints} path points near trees (${overallOverlapPct.toFixed(1)}%)`, overallOverlapPct > 0 ? 'success' : 'warning');
+        }
+        
+        // Test specific tree locations
+        function testSpecificTreeLocations() {
+            if (treeData.length === 0) {
+                log('❌ Load tree data first', 'error');
+                return;
+            }
+            
+            log('🎯 Testing specific tree locations...', 'info');
+            
+            // Test pathfinding to/from specific tree locations
+            const testTrees = treeData.slice(0, 5); // First 5 trees
+            
+            testTrees.forEach((tree, index) => {
+                const nearbyTrees = treeData.filter(t => 
+                    t.id !== tree.id && 
+                    Math.sqrt(Math.pow(t.lat - tree.lat, 2) + Math.pow(t.lng - tree.lng, 2)) < 0.01
+                );
+                
+                if (nearbyTrees.length > 0) {
+                    const targetTree = nearbyTrees[0];
+                    
+                    // Test pathfinding between these trees
+                    fetch('http://localhost:8000/shortest_path_shade', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            start_lat: tree.lat,
+                            start_lng: tree.lng,
+                            end_lat: targetTree.lat,
+                            end_lng: targetTree.lng,
+                            time: 9,
+                            shade_penalty: 1.0
+                        })
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.error) {
+                            log(`❌ Tree ${tree.id} → Tree ${targetTree.id}: ${data.error}`, 'error');
+                        } else {
+                            const pathCoords = data.path || [];
+                            log(`✅ Tree ${tree.id} → Tree ${targetTree.id}: ${pathCoords.length} points, ${(data.original_distance_m || 0).toFixed(1)}m`, 'success');
+                            
+                            // Check if path goes through tree areas
+                            const pathInTreeArea = pathCoords.some(coord => 
+                                treeData.some(t => 
+                                    Math.sqrt(Math.pow(coord[0] - t.lat, 2) + Math.pow(coord[1] - t.lng, 2)) < 0.001
+                                )
+                            );
+                            
+                            log(`   ${pathInTreeArea ? '✅' : '❌'} Path ${pathInTreeArea ? 'goes through' : 'avoids'} tree areas`, pathInTreeArea ? 'success' : 'warning');
+                        }
+                    })
+                    .catch(error => {
+                        log(`❌ Tree ${tree.id} → Tree ${targetTree.id}: ${error.message}`, 'error');
+                    });
+                }
+            });
+        }
+        
+        // Clear results
+        function clearResults() {
+            document.getElementById('results').innerHTML = '';
+            document.getElementById('treeAnalysis').innerHTML = '';
+            document.getElementById('pathAnalysis').innerHTML = '';
+            testMarkers.forEach(marker => map.removeLayer(marker));
+            testMarkers = [];
+            treeShadowLayer.clearLayers();
+            pathLayer.clearLayers();
+        }
+        
+        // Initialize when page loads
+        window.onload = function() {
+            initMap();
+        };
+    </script>
+</body>
+</html>

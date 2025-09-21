@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tree Shadow Detection Test</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { margin: 0; padding: 20px; font-family: Arial, sans-serif; }
+        #map { height: 500px; width: 100%; border: 2px solid #ccc; }
+        .controls { margin: 20px 0; }
+        .controls button { margin: 5px; padding: 10px 15px; font-size: 14px; }
+        .debug-info { 
+            background: #f5f5f5; 
+            padding: 15px; 
+            margin: 10px 0; 
+            border-radius: 5px; 
+            font-family: monospace; 
+            white-space: pre-wrap; 
+        }
+        .test-result { 
+            padding: 10px; 
+            margin: 5px 0; 
+            border-radius: 3px; 
+        }
+        .success { background: #d4edda; color: #155724; }
+        .error { background: #f8d7da; color: #721c24; }
+        .info { background: #d1ecf1; color: #0c5460; }
+    </style>
+</head>
+<body>
+    <h1>🌳 Tree Shadow Detection Test</h1>
+    <p>This test will help us debug tree shadow detection in isolation.</p>
+    
+    <div class="controls">
+        <button onclick="loadTreeShadows()">1. Load Tree Shadows</button>
+        <button onclick="testPointInPolygon()">2. Test Point-in-Polygon</button>
+        <button onclick="testPathAnalysis()">3. Test Path Analysis</button>
+        <button onclick="clearResults()">Clear Results</button>
+    </div>
+    
+    <div id="map"></div>
+    
+    <div id="results"></div>
+    
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Global variables
+        let map;
+        let treeShadowLayer;
+        let testMarkers = [];
+        
+        // Initialize map
+        function initMap() {
+            // Center on area where trees actually exist (based on tree_positions.json data)
+            map = L.map('map').setView([39.950, -75.160], 16);
+            
+            L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; OSM'
+            }).addTo(map);
+            
+            treeShadowLayer = L.layerGroup().addTo(map);
+            
+            log('✅ Map initialized at tree-dense area [39.950, -75.160]', 'success');
+        }
+        
+        // Logging function
+        function log(message, type = 'info') {
+            const results = document.getElementById('results');
+            const div = document.createElement('div');
+            div.className = `test-result ${type}`;
+            div.textContent = `${new Date().toLocaleTimeString()}: ${message}`;
+            results.appendChild(div);
+            console.log(message);
+        }
+        
+        // Load tree shadows from backend
+        async function loadTreeShadows() {
+            try {
+                log('🌳 Loading tree shadows from backend...', 'info');
+                
+                const response = await fetch('http://localhost:8000/tree_shadows');
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const data = await response.json();
+                
+                if (!data.features || !Array.isArray(data.features)) {
+                    throw new Error('No features found in response');
+                }
+                
+                // Clear existing tree shadows
+                treeShadowLayer.clearLayers();
+                
+                // Add tree shadow polygons
+                let polygonsAdded = 0;
+                data.features.forEach((feature, index) => {
+                    try {
+                        const { geometry, properties } = feature;
+                        
+                        if (geometry.type === 'Polygon' && geometry.coordinates && geometry.coordinates[0]) {
+                            // Convert GeoJSON coordinates [lng, lat] to Leaflet format [lat, lng]
+                            const leafletCoords = geometry.coordinates[0].map(coord => [coord[1], coord[0]]);
+                            
+                            // Debug: Log first few polygons for verification
+                            if (index < 3) {
+                                log(`🔍 Tree ${properties.tree_id}: Center [${properties.center_lat?.toFixed(6)}, ${properties.center_lng?.toFixed(6)}], Radius ${properties.radius_m?.toFixed(1)}m`, 'info');
+                                log(`   First 3 coords: ${leafletCoords.slice(0, 3).map(c => `[${c[0].toFixed(6)}, ${c[1].toFixed(6)}]`).join(', ')}`, 'info');
+                            }
+                            
+                            // Create polygon with shadow styling
+                            const polygon = L.polygon(leafletCoords, {
+                                fillColor: '#01112f',  // Same as building shadows
+                                color: '#01112f',      
+                                fillOpacity: 0.5,      
+                                opacity: 0.7,          
+                                weight: 1,             
+                                className: 'tree-shadow-polygon'
+                            });
+                            
+                            // Add tooltip
+                            polygon.bindTooltip(`Tree ${properties.tree_id || index}: Density ${(properties.density || 0).toFixed(2)}, Radius ${(properties.radius_m || 0).toFixed(1)}m`);
+                            
+                            polygon.addTo(treeShadowLayer);
+                            polygonsAdded++;
+                        }
+                    } catch (error) {
+                        console.warn(`Error rendering tree shadow ${index}:`, error);
+                    }
+                });
+                
+                log(`✅ Loaded ${polygonsAdded} tree shadow polygons`, 'success');
+                
+                // Debug: Show layer info
+                let layerCount = 0;
+                treeShadowLayer.eachLayer(() => layerCount++);
+                log(`🔍 Tree shadow layer has ${layerCount} layers`, 'info');
+                
+            } catch (error) {
+                log(`❌ Failed to load tree shadows: ${error.message}`, 'error');
+            }
+        }
+        
+        // Point-in-polygon algorithm (ray casting)
+        function isPointInPolygon(point, polygon) {
+            const x = point.lat;
+            const y = point.lng;
+            let inside = false;
+            
+            for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+                const xi = polygon[i].lat;
+                const yi = polygon[i].lng;
+                const xj = polygon[j].lat;
+                const yj = polygon[j].lng;
+                
+                if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+                    inside = !inside;
+                }
+            }
+            
+            return inside;
+        }
+        
+        // Check if point is in any tree shadow
+        function isPointInTreeShadow(latlng) {
+            if (!treeShadowLayer) {
+                return { inside: false, error: 'Tree shadow layer not available' };
+            }
+            
+            let polygonCount = 0;
+            let totalLayerCount = 0;
+            let matchingPolygon = null;
+            let debugInfo = [];
+            
+            treeShadowLayer.eachLayer((layer) => {
+                totalLayerCount++;
+                if (layer instanceof L.Polygon) {
+                    polygonCount++;
+                    const latLng = L.latLng(latlng[0], latlng[1]);
+                    const polygonPoints = layer.getLatLngs()[0];
+                    
+                    // Debug: Check first few polygons in detail
+                    if (polygonCount <= 3) {
+                        const bounds = layer.getBounds();
+                        debugInfo.push(`Polygon ${polygonCount}: bounds [${bounds.getSouth().toFixed(6)}, ${bounds.getWest().toFixed(6)}] to [${bounds.getNorth().toFixed(6)}, ${bounds.getEast().toFixed(6)}]`);
+                    }
+                    
+                    if (isPointInPolygon(latLng, polygonPoints)) {
+                        matchingPolygon = layer;
+                        return false; // Break
+                    }
+                }
+            });
+            
+            return {
+                inside: !!matchingPolygon,
+                polygonCount,
+                totalLayerCount,
+                matchingPolygon,
+                debugInfo
+            };
+        }
+        
+        // Test point-in-polygon detection
+        function testPointInPolygon() {
+            log('🎯 Testing point-in-polygon detection...', 'info');
+            
+            if (!treeShadowLayer) {
+                log('❌ Tree shadow layer not loaded. Load tree shadows first.', 'error');
+                return;
+            }
+            
+            // Clear previous test markers
+            testMarkers.forEach(marker => map.removeLayer(marker));
+            testMarkers = [];
+            
+            // Test points in areas where trees actually exist (based on tree_positions.json data)
+            const testPoints = [
+                [39.949, -75.171, 'Point A (Tree ID 0)'],      // Exact tree location
+                [39.947, -75.151, 'Point B (Tree ID 1)'],      // Exact tree location  
+                [39.94005, -75.16935, 'Point C (Tree ID 5)'],  // Exact tree location
+                [39.9406, -75.1628, 'Point D (Tree ID 25)'],   // Exact tree location
+                [39.950, -75.160, 'Point E (Between trees)']   // Between trees (should be NOT in shadow)
+            ];
+            
+            testPoints.forEach(([lat, lng, name]) => {
+                const result = isPointInTreeShadow([lat, lng]);
+                
+                // Add marker with color based on result
+                const marker = L.circleMarker([lat, lng], {
+                    radius: 8,
+                    fillColor: result.inside ? '#00ff00' : '#ff0000',
+                    color: '#000',
+                    weight: 2,
+                    opacity: 1,
+                    fillOpacity: 0.8
+                }).addTo(map);
+                
+                marker.bindTooltip(`${name}: ${result.inside ? 'IN SHADOW' : 'NOT IN SHADOW'}`);
+                testMarkers.push(marker);
+                
+                log(`${name} (${lat}, ${lng}): ${result.inside ? '✅ IN SHADOW' : '❌ NOT IN SHADOW'}`, 
+                    result.inside ? 'success' : 'info');
+                
+                // Debug info for first point
+                if (name.includes('Point A') && result.debugInfo) {
+                    result.debugInfo.forEach(info => log(`   ${info}`, 'info'));
+                }
+            });
+            
+            log(`🔍 Found ${testPoints.filter(([lat, lng]) => isPointInTreeShadow([lat, lng]).inside).length} points in shadows out of ${testPoints.length} tested`, 'info');
+        }
+        
+        // Test path analysis (simplified version)
+        function testPathAnalysis() {
+            log('🛣️ Testing path analysis...', 'info');
+            
+            if (!treeShadowLayer) {
+                log('❌ Tree shadow layer not loaded. Load tree shadows first.', 'error');
+                return;
+            }
+            
+            // Create a test path through actual tree locations
+            const pathCoords = [
+                [39.949, -75.171],    // Tree ID 0
+                [39.947, -75.151],    // Tree ID 1
+                [39.94005, -75.16935], // Tree ID 5
+                [39.9406, -75.1628],  // Tree ID 25
+                [39.950, -75.160]     // Between trees
+            ];
+            
+            // Draw path on map
+            const pathLine = L.polyline(pathCoords, {
+                color: 'blue',
+                weight: 4,
+                opacity: 0.8
+            }).addTo(map);
+            
+            // Analyze path segments
+            let totalHits = 0;
+            let totalSamples = 0;
+            
+            for (let i = 0; i < pathCoords.length - 1; i++) {
+                const start = pathCoords[i];
+                const end = pathCoords[i + 1];
+                
+                // Sample points along segment (simplified)
+                const samples = 10;
+                let segmentHits = 0;
+                
+                for (let j = 0; j <= samples; j++) {
+                    const t = j / samples;
+                    const lat = start[0] + (end[0] - start[0]) * t;
+                    const lng = start[1] + (end[1] - start[1]) * t;
+                    
+                    const result = isPointInTreeShadow([lat, lng]);
+                    if (result.inside) {
+                        segmentHits++;
+                    }
+                    totalSamples++;
+                }
+                
+                totalHits += segmentHits;
+                const segmentShade = (segmentHits / (samples + 1)) * 100;
+                
+                log(`Segment ${i}: ${segmentHits}/${samples + 1} hits = ${segmentShade.toFixed(1)}% shade`, 
+                    segmentShade > 0 ? 'success' : 'info');
+            }
+            
+            const totalShade = (totalHits / totalSamples) * 100;
+            log(`🎯 TOTAL PATH ANALYSIS: ${totalHits}/${totalSamples} hits = ${totalShade.toFixed(1)}% shade`, 
+                totalShade > 0 ? 'success' : 'error');
+        }
+        
+        // Clear results
+        function clearResults() {
+            document.getElementById('results').innerHTML = '';
+            testMarkers.forEach(marker => map.removeLayer(marker));
+            testMarkers = [];
+        }
+        
+        // Initialize when page loads
+        window.onload = function() {
+            initMap();
+        };
+    </script>
+</body>
+</html>

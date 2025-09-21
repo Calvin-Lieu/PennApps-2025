@@ -43,10 +43,16 @@ See: https://devpost.com/software/shadenav
 - **Essential Services**: Water fountains, convenience stores, and climate-controlled spaces
 - **Adaptive Selection**: Dynamic waypoint adjustment based on route length and weather conditions
 
+### Weather and UV Integration 
+- **Hourly Weather & UV Updates:** Real-time weather and UV index integrated directly into routing, refreshing every hour.
+- **Heat-Aware Routing:** Helps pedestrians track heat stress conditions, avoid unsafe UV exposure, and choose cooler, safer walking paths.
+
 ### Terrain Heuristic for Pathfinding
 - **Grade-Aware Costing**: Incorporates slope from DEM tiles to penalize steep segments.
 - **Surface & Roughness Scoring**: Weights edges by OSM surface (e.g. cobblestone, unpaved) when respective toggles are checked
 - **Accessibility Constraints**: Applies hard costs to stairs/steps and soft penalties for camber/irregularity, enabling wheelchair-friendly routing and safer sidewalk selection
+
+
 
 ## Quickstart
 
@@ -195,3 +201,7 @@ Temporal shadow analysis across different hours of the day, demonstrating how sh
 - `earthengine-api`: Google Earth Engine integration for satellite data
 - `python-dotenv`: Environment variable management
 - `scipy`: Advanced interpolation for satellite data processing
+
+### External Services
+- **Open-Meteo**: Provides real-time weather and UV index data for routing decisions. [Attribution](https://open-meteo.com/)
+

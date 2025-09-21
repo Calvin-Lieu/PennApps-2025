@@ -182,7 +182,7 @@ Aggregated shade coverage analysis that combines temporal shadow data across all
 
 - **Tree Detection System**: High-resolution NDVI/NDWI analysis with 5m grid scoring, successfully identifying 700+ urban trees.  
 
-![Prototype demo image with water stops shown with water droplet, leaflet POI tags include `drinking_water`, `cafe`, `vending_machine`.](figs/hackathon8)
+![Prototype demo image with water stops shown with water droplet, leaflet POI tags include `drinking_water`, `cafe`, `vending_machine`.](figs/hackathon8.png)
 - **Water Stop Waypoint Routing**: Dynamic re-routing through convenience stores and water fountains using POI snapping and path-projection heuristics.  
 
 ## Future Work

@@ -1,5 +1,7 @@
 # PennApps 2025: ShadeNav
 
+![ShadeNav Demo](figs/hackathon7.png)
+
 Climate change has created a devastating feedback loop: rising temperatures make walking unbearable, forcing people to drive more, pumping more greenhouse gases into the atmosphere, making cities even hotter.
 
 **ShadeNav breaks this cycle** by making walking comfortable again through intelligent shade-optimized routing. Using satellite analysis and real-time sun positioning, we find paths that maximize shade coverage - because shaded areas feel up to 20°F cooler than direct sunlight.
@@ -7,7 +9,6 @@ Climate change has created a devastating feedback loop: rising temperatures make
 A comprehensive route-planning system for downtown Philadelphia that optimizes paths based on shade coverage and essential services using advanced satellite imagery analysis and OpenStreetMap data.
 
 See: https://devpost.com/software/shadenav
-
 
 ## Project Structure
 
